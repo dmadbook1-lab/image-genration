@@ -7,10 +7,6 @@ FastAPI service wrapping GPT Image 2 (images) and Veo 3.1 (video) generation.
 - `image_generation.py` — GPT Image 2 logic + `/api/image/generate` route
 - `video_generation.py` — Veo/Gemini logic + `/api/video/generate` and `/api/video/status/{job_id}` routes
 
-## ⚠️ Security first
-The original snippet had an OpenAI key hardcoded in plaintext. **Rotate that key
-immediately** in the OpenAI dashboard, then set it as an environment variable —
-never put it in source code.
 
 ## Setup
 
@@ -18,10 +14,7 @@ never put it in source code.
 pip install -r requirements.txt
 sudo apt-get install ffmpeg   # required for video segment stitching
 
-export OPENAI_API_KEY="sk-..."
-export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
-export GOOGLE_CLOUD_REGION="us-central1"                 # optional, this is the default
-export GOOGLE_APPLICATION_CREDENTIALS="/path/service-account.json"  # for Vertex AI auth on a server
+
 
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
@@ -133,12 +126,3 @@ by the `url` / `video_url` fields above.
 3. When `status == "completed"`, play `baseUrl + video_url` (e.g. with
    `video_player` package)
 
-## Notes on production hardening
-- The job store is in-memory — if you run multiple server processes/replicas,
-  move it to Redis or a database so all instances see the same job state.
-- Add authentication (e.g. an API key or JWT) before exposing this publicly,
-  since generation calls cost money per request.
-- Add periodic cleanup of the `generated/` directory so it doesn't grow
-  unbounded.
-- Consider request size/timeout limits on the reverse proxy in front of this
-  service (nginx/etc.) for file uploads.
