@@ -68,3 +68,6 @@ db.sqlite3
 # Python version
 .python-version
 
+
+# Local AI outputs (never commit — can exceed GitHub 100MB limit)
+generated/

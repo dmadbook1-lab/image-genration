@@ -8,7 +8,8 @@ Required environment variables:
     OPENAI_API_KEY                 - your OpenAI key (DO NOT hardcode it)
     GOOGLE_CLOUD_PROJECT            - GCP project id used for Veo/Gemini (Vertex AI)
     GOOGLE_CLOUD_REGION             - defaults to "us-central1" if unset
-    GOOGLE_APPLICATION_CREDENTIALS  - path to a service account JSON key
+    (optional) GOOGLE_APPLICATION_CREDENTIALS - service account JSON key;
+        for local dev, prefer: gcloud auth application-default login
 
 Also requires the `ffmpeg` binary to be installed on the host machine.
 See README.md for full endpoint documentation.

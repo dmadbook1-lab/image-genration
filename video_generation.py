@@ -9,11 +9,16 @@ Exposes:
 Required environment variables:
   GOOGLE_CLOUD_PROJECT
   GOOGLE_CLOUD_REGION (optional, defaults to "us-central1")
-  GOOGLE_APPLICATION_CREDENTIALS (path to a service account JSON key)
+
+Authenticate locally with Application Default Credentials (recommended):
+  gcloud auth login
+  gcloud config set project <your-project-id>
+  gcloud auth application-default login
 
 Also requires the `ffmpeg` binary on the host.
 """
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -25,8 +30,12 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from s3_storage import normalize_user_id, store_generated_media
+
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
+
+logger = logging.getLogger(__name__)
 
 SEGMENT_LEN = 8  # Veo 3.1 only accepts 4, 6, or 8 seconds per single call
 _LANGUAGE_CODES = {"English": "en", "Hindi": "hi", "Marathi": "mr"}
@@ -37,10 +46,6 @@ router = APIRouter(prefix="/api/video", tags=["video"])
 # In-memory job store. Swap for Redis/DB if you run multiple server processes.
 _jobs = {}
 _jobs_lock = threading.Lock()
-
-
-def _public_url(filename: str) -> str:
-    return f"/files/{filename}"
 
 
 def _set_job(job_id: str, **fields):
@@ -56,8 +61,8 @@ def _get_genai_clients():
         raise RuntimeError("GOOGLE_CLOUD_PROJECT environment variable is not set.")
     location = os.environ.get("GOOGLE_CLOUD_REGION", "us-central1")
 
-    client = genai.Client(enterprise=True, project=project_id, location=location)
-    gemini_client = genai.Client(enterprise=True, project=project_id, location="global")
+    client = genai.Client(vertexai=True, project=project_id, location=location)
+    gemini_client = genai.Client(vertexai=True, project=project_id, location="global")
     return client, gemini_client
 
 
@@ -85,6 +90,63 @@ def concat_and_trim(clip_paths, out_path, target_seconds):
         check=True,
         capture_output=True,
     )
+
+
+def _wait_for_video_operation(client, operation, poll_seconds=15, max_wait=900):
+    elapsed = 0
+    while not operation.done:
+        if elapsed >= max_wait:
+            raise RuntimeError(f"Video generation timed out after {max_wait}s")
+        time.sleep(poll_seconds)
+        elapsed += poll_seconds
+        operation = client.operations.get(operation)
+    return operation
+
+
+def _video_operation_payload(operation):
+    if operation.error:
+        raise RuntimeError(f"Video generation failed: {operation.error}")
+
+    payload = operation.response or operation.result
+    if payload is None:
+        raise RuntimeError("Video generation completed but returned no response.")
+
+    generated_videos = payload.generated_videos
+    if not generated_videos:
+        reasons = payload.rai_media_filtered_reasons or []
+        count = payload.rai_media_filtered_count
+        detail = ""
+        if reasons:
+            detail = f" RAI reasons: {reasons}"
+        elif count is not None:
+            detail = f" RAI filtered count: {count}"
+        raise RuntimeError(f"Video generation returned no videos.{detail}")
+
+    return generated_videos[0]
+
+
+def _download_video_bytes(video) -> bytes:
+    if video.video_bytes:
+        return video.video_bytes
+
+    uri = video.uri
+    if not uri:
+        raise RuntimeError("Generated video has no bytes or URI.")
+
+    if uri.startswith("gs://"):
+        from google.cloud import storage
+
+        _, _, rest = uri.partition("gs://")
+        bucket_name, _, blob_name = rest.partition("/")
+        if not bucket_name or not blob_name:
+            raise RuntimeError(f"Invalid GCS URI: {uri}")
+        return storage.Client().bucket(bucket_name).blob(blob_name).download_as_bytes()
+
+    import httpx
+
+    response = httpx.get(uri, follow_redirects=True, timeout=120.0)
+    response.raise_for_status()
+    return response.content
 
 
 def build_prompt(language_name, ad_text, segment_index, covered_context, camera_motion):
@@ -142,7 +204,9 @@ def generate_segment(client, gemini_client, gemini_model, video_model, image_pat
         model=gemini_model,
         contents=[prompt_text, types.Part.from_bytes(data=image_bytes, mime_type=mime)],
     )
-    veo_prompt = gem_response.text.strip()
+    veo_prompt = (gem_response.text or "").strip()
+    if not veo_prompt:
+        raise RuntimeError("Gemini returned an empty Veo prompt.")
 
     operation = client.models.generate_videos(
         model=video_model,
@@ -158,14 +222,13 @@ def generate_segment(client, gemini_client, gemini_model, video_model, image_pat
         ),
     )
 
-    while not operation.done:
-        time.sleep(15)
-        operation = client.operations.get(operation)
+    operation = _wait_for_video_operation(client, operation)
+    generated = _video_operation_payload(operation)
+    if generated.video is None:
+        raise RuntimeError("Generated video entry is missing video data.")
 
-    if not operation.response:
-        raise RuntimeError("Video generation failed / returned no response.")
-
-    return operation.result.generated_videos[0].video.video_bytes, veo_prompt
+    video_bytes = _download_video_bytes(generated.video)
+    return video_bytes, veo_prompt
 
 
 def _run_video_job(
@@ -175,12 +238,13 @@ def _run_video_job(
     language_name: str,
     target_seconds: int,
     camera_motion: str,
+    user_id: str,
 ):
-    gemini_model = "gemini-3.5-flash"
-    video_model = "veo-3.1-generate-001"
+    gemini_model = "gemini-2.5-flash"
+    video_model = "veo-3.1-lite-generate-001"
 
     try:
-        _set_job(job_id, status="processing", progress="Initializing")
+        _set_job(job_id, status="processing", progress="Initializing", user_id=user_id)
         client, gemini_client = _get_genai_clients()
 
         n_segments = max(1, -(-target_seconds // SEGMENT_LEN))  # ceil division
@@ -221,13 +285,26 @@ def _run_video_job(
             else:
                 concat_and_trim(clip_paths, out_path, target_seconds)
 
+        _set_job(job_id, progress="Uploading to S3")
+        video_url, s3_key = store_generated_media(
+            local_path=out_path,
+            user_id=user_id,
+            media_kind="videos",
+            filename=filename,
+            content_type="video/mp4",
+            delete_local=True,
+        )
+
         _set_job(
             job_id,
             status="completed",
             progress="Done",
-            video_url=_public_url(filename),
+            video_url=video_url,
+            s3_key=s3_key,
+            user_id=user_id,
         )
     except Exception as exc:
+        logger.exception("Video job %s failed", job_id)
         _set_job(job_id, status="failed", error=str(exc))
     finally:
         if os.path.exists(starting_image_path):
@@ -237,6 +314,7 @@ def _run_video_job(
 class VideoGenerateResponse(BaseModel):
     job_id: str
     status: str
+    user_id: str
 
 
 class VideoStatusResponse(BaseModel):
@@ -244,6 +322,8 @@ class VideoStatusResponse(BaseModel):
     status: str  # queued | processing | completed | failed
     progress: Optional[str] = None
     video_url: Optional[str] = None
+    s3_key: Optional[str] = None
+    user_id: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -252,27 +332,35 @@ async def api_generate_video(
     background_tasks: BackgroundTasks,
     starting_image: UploadFile = File(...),
     ad_text: str = Form(...),
+    user_id: str = Form(...),
     language: str = Form("Marathi"),
     duration_seconds: int = Form(30),
     camera_motion: str = Form("Zoom (In)"),
 ):
     """
     Starts an async video generation job (this can take several minutes).
+    On completion, stores under users/{user_id}/generated/videos/ on S3.
 
     multipart/form-data fields:
       - starting_image (required): the first-frame image file
       - ad_text (required): raw ad copy to turn into a voiceover script
+      - user_id (required): logged-in AdvPost user id
       - language: one of English, Hindi, Marathi (default Marathi)
       - duration_seconds: one of 8, 16, 30 (default 30)
       - camera_motion: e.g. "Zoom (In)", "Pan (left)", "Static Shot (or fixed)", etc.
 
     Returns a job_id. Poll GET /api/video/status/{job_id} until status is
-    "completed" (or "failed"), then download video_url.
+    "completed" (or "failed"), then use video_url (S3 public URL).
     """
     if language not in _LANGUAGE_CODES:
         raise HTTPException(400, f"language must be one of {list(_LANGUAGE_CODES)}")
     if duration_seconds not in _ALLOWED_DURATIONS:
         raise HTTPException(400, f"duration_seconds must be one of {sorted(_ALLOWED_DURATIONS)}")
+
+    try:
+        uid = normalize_user_id(user_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     job_id = uuid.uuid4().hex
     suffix = os.path.splitext(starting_image.filename or "")[1] or ".jpg"
@@ -286,6 +374,8 @@ async def api_generate_video(
             "status": "queued",
             "progress": None,
             "video_url": None,
+            "s3_key": None,
+            "user_id": uid,
             "error": None,
         }
 
@@ -297,9 +387,10 @@ async def api_generate_video(
         language,
         duration_seconds,
         camera_motion,
+        uid,
     )
 
-    return VideoGenerateResponse(job_id=job_id, status="queued")
+    return VideoGenerateResponse(job_id=job_id, status="queued", user_id=uid)
 
 
 @router.get("/status/{job_id}", response_model=VideoStatusResponse)

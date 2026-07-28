@@ -5,3 +5,4 @@ openai
 google-genai
 pydantic
 python-dotenv
+boto3
