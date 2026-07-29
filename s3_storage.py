@@ -84,7 +84,14 @@ def s3_public_url(key: str) -> str:
 def _get_s3_client():
     """Return a cached boto3 S3 client; rebuild if credentials/region change."""
     global _s3_client, _s3_client_key
-    import boto3
+    try:
+        import boto3
+        from botocore.exceptions import BotoCoreError, ClientError  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "boto3/botocore is not installed. On the server run: "
+            "pip install boto3 botocore  (or: pip install -r requirements.txt)"
+        ) from exc
 
     require_s3()
 

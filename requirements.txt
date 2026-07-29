@@ -6,3 +6,4 @@ google-genai
 pydantic
 python-dotenv
 boto3
+botocore
