@@ -11,6 +11,7 @@ users/{user_id}/generated/videos/{id}.mp4
 
 ## File structure
 - `main.py` — app setup, CORS, static file mount, wires in the two routers below
+- `job_runtime.py` — shared thread pool + in-memory job store (TTL prune)
 - `image_generation.py` — GPT Image 2 logic + `/api/image/generate` and `/api/image/status/{job_id}` routes
 - `video_generation.py` — Veo/Gemini logic + `/api/video/generate` and `/api/video/status/{job_id}` routes
 - `s3_storage.py` — AWS S3 upload helpers (canonical per-user keys)
@@ -28,6 +29,12 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 AWS keys must match the PHP backend (`aws_credential` table / `application/config/aws.php`).
 `S3_REQUIRED=1` (default) means generation fails if S3 is not configured.
+
+Optional performance tuning in `.env`:
+- `MEDIA_MAX_WORKERS=3` — max concurrent image/video jobs (default 3)
+- `MEDIA_JOB_TTL_SECONDS=3600` — prune completed/failed jobs from memory after 1 hour
+
+Jobs run on a thread pool so `/health` and `/status` stay responsive while generation is in progress.
 
 Note: the original notebook used `google.colab.auth.authenticate_user()`. That
 only works inside Colab. On a real server, authenticate via a GCP **service
@@ -56,7 +63,7 @@ Content-Type: `multipart/form-data`
 | `prompt` | string | yes | the image prompt |
 | `user_id` | string | yes | logged-in AdvPost user id (S3 folder) |
 | `size` | string | no | `1024x1024` \| `1536x1024` \| `1024x1536` \| `auto` (default `1536x1024`) |
-| `quality` | string | no | `low` \| `medium` \| `high` \| `auto` (default `high`) |
+| `quality` | string | no | `low` \| `medium` \| `high` \| `auto` (default `medium`) |
 | `reference_image` | file | no | optional reference image to edit from |
 
 **Response `200`:**

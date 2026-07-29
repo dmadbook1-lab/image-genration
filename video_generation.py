@@ -27,9 +27,10 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from job_runtime import create_job, get_job, submit_job, update_job
 from s3_storage import normalize_user_id, store_generated_media
 
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
@@ -43,27 +44,33 @@ _ALLOWED_DURATIONS = {8, 16, 30}
 
 router = APIRouter(prefix="/api/video", tags=["video"])
 
-# In-memory job store. Swap for Redis/DB if you run multiple server processes.
-_jobs = {}
-_jobs_lock = threading.Lock()
-
-
-def _set_job(job_id: str, **fields):
-    with _jobs_lock:
-        _jobs[job_id].update(fields)
+_genai_clients = None
+_genai_clients_key: Optional[tuple[str, str]] = None
+_genai_clients_lock = threading.Lock()
 
 
 def _get_genai_clients():
+    """Return cached Vertex GenAI clients; rebuild if project/region change."""
+    global _genai_clients, _genai_clients_key
     from google import genai
 
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
     if not project_id:
         raise RuntimeError("GOOGLE_CLOUD_PROJECT environment variable is not set.")
     location = os.environ.get("GOOGLE_CLOUD_REGION", "us-central1")
+    key = (project_id, location)
 
-    client = genai.Client(vertexai=True, project=project_id, location=location)
-    gemini_client = genai.Client(vertexai=True, project=project_id, location="global")
-    return client, gemini_client
+    if _genai_clients is not None and _genai_clients_key == key:
+        return _genai_clients
+
+    with _genai_clients_lock:
+        if _genai_clients is not None and _genai_clients_key == key:
+            return _genai_clients
+        client = genai.Client(vertexai=True, project=project_id, location=location)
+        gemini_client = genai.Client(vertexai=True, project=project_id, location="global")
+        _genai_clients = (client, gemini_client)
+        _genai_clients_key = key
+        return _genai_clients
 
 
 def extract_last_frame(video_path, frame_path):
@@ -244,7 +251,7 @@ def _run_video_job(
     video_model = "veo-3.1-lite-generate-001"
 
     try:
-        _set_job(job_id, status="processing", progress="Initializing", user_id=user_id)
+        update_job(job_id, status="processing", progress="Initializing", user_id=user_id)
         client, gemini_client = _get_genai_clients()
 
         n_segments = max(1, -(-target_seconds // SEGMENT_LEN))  # ceil division
@@ -255,7 +262,7 @@ def _run_video_job(
             current_image = starting_image_path
 
             for i in range(n_segments):
-                _set_job(job_id, progress=f"Generating segment {i + 1}/{n_segments}")
+                update_job(job_id, progress=f"Generating segment {i + 1}/{n_segments}")
                 prompt_text = build_prompt(language_name, ad_text, i, covered_context, camera_motion)
                 video_bytes, used_prompt = generate_segment(
                     client, gemini_client, gemini_model, video_model, current_image, prompt_text
@@ -272,7 +279,7 @@ def _run_video_job(
                     extract_last_frame(clip_path, frame_path)
                     current_image = frame_path
 
-            _set_job(job_id, progress="Finalizing video")
+            update_job(job_id, progress="Finalizing video")
             filename = f"{job_id}.mp4"
             out_path = os.path.join(GENERATED_DIR, filename)
 
@@ -285,7 +292,7 @@ def _run_video_job(
             else:
                 concat_and_trim(clip_paths, out_path, target_seconds)
 
-        _set_job(job_id, progress="Uploading to S3")
+        update_job(job_id, progress="Uploading to S3")
         video_url, s3_key = store_generated_media(
             local_path=out_path,
             user_id=user_id,
@@ -295,7 +302,7 @@ def _run_video_job(
             delete_local=True,
         )
 
-        _set_job(
+        update_job(
             job_id,
             status="completed",
             progress="Done",
@@ -305,7 +312,7 @@ def _run_video_job(
         )
     except Exception as exc:
         logger.exception("Video job %s failed", job_id)
-        _set_job(job_id, status="failed", error=str(exc))
+        update_job(job_id, status="failed", error=str(exc))
     finally:
         if os.path.exists(starting_image_path):
             os.remove(starting_image_path)
@@ -329,7 +336,6 @@ class VideoStatusResponse(BaseModel):
 
 @router.post("/generate", response_model=VideoGenerateResponse)
 async def api_generate_video(
-    background_tasks: BackgroundTasks,
     starting_image: UploadFile = File(...),
     ad_text: str = Form(...),
     user_id: str = Form(...),
@@ -338,7 +344,7 @@ async def api_generate_video(
     camera_motion: str = Form("Zoom (In)"),
 ):
     """
-    Starts an async video generation job (this can take several minutes).
+    Starts an async video generation job on a worker thread (can take several minutes).
     On completion, stores under users/{user_id}/generated/videos/ on S3.
 
     multipart/form-data fields:
@@ -368,18 +374,17 @@ async def api_generate_video(
     with open(tmp_image_path, "wb") as f:
         f.write(await starting_image.read())
 
-    with _jobs_lock:
-        _jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "progress": None,
-            "video_url": None,
-            "s3_key": None,
-            "user_id": uid,
-            "error": None,
-        }
+    create_job(
+        job_id,
+        status="queued",
+        progress=None,
+        video_url=None,
+        s3_key=None,
+        user_id=uid,
+        error=None,
+    )
 
-    background_tasks.add_task(
+    submit_job(
         _run_video_job,
         job_id,
         tmp_image_path,
@@ -395,8 +400,15 @@ async def api_generate_video(
 
 @router.get("/status/{job_id}", response_model=VideoStatusResponse)
 async def api_video_status(job_id: str):
-    with _jobs_lock:
-        job = _jobs.get(job_id)
+    job = get_job(job_id)
     if job is None:
         raise HTTPException(404, "job_id not found")
-    return VideoStatusResponse(**job)
+    return VideoStatusResponse(
+        job_id=job["job_id"],
+        status=job.get("status", "queued"),
+        progress=job.get("progress"),
+        video_url=job.get("video_url"),
+        s3_key=job.get("s3_key"),
+        user_id=job.get("user_id"),
+        error=job.get("error"),
+    )

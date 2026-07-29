@@ -11,9 +11,14 @@ from __future__ import annotations
 import mimetypes
 import os
 import re
+import threading
 from typing import Optional
 
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+_s3_client = None
+_s3_client_lock = threading.Lock()
+_s3_client_key: Optional[tuple[str, str, str, str]] = None
 
 
 def s3_enabled() -> bool:
@@ -76,30 +81,49 @@ def s3_public_url(key: str) -> str:
     return f"{base}/{key.lstrip('/')}"
 
 
-def upload_file_to_s3(local_path: str, key: str, content_type: Optional[str] = None) -> str:
-    """Upload a local file and return the public S3 URL."""
+def _get_s3_client():
+    """Return a cached boto3 S3 client; rebuild if credentials/region change."""
+    global _s3_client, _s3_client_key
     import boto3
-    from botocore.exceptions import BotoCoreError, ClientError
 
     require_s3()
+
+    region = os.environ.get("AWS_REGION", "ap-south-1")
+    access_key = os.environ["AWS_ACCESS_KEY_ID"]
+    secret_key = os.environ["AWS_SECRET_ACCESS_KEY"]
+    bucket = os.environ["AWS_BUCKET_NAME"]
+    key = (region, access_key, secret_key, bucket)
+
+    if _s3_client is not None and _s3_client_key == key:
+        return _s3_client
+
+    with _s3_client_lock:
+        if _s3_client is not None and _s3_client_key == key:
+            return _s3_client
+        _s3_client = boto3.client(
+            "s3",
+            region_name=region,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
+        _s3_client_key = key
+        return _s3_client
+
+
+def upload_file_to_s3(local_path: str, key: str, content_type: Optional[str] = None) -> str:
+    """Upload a local file and return the public S3 URL."""
+    from botocore.exceptions import BotoCoreError, ClientError
 
     if not os.path.isfile(local_path):
         raise FileNotFoundError(f"Local file not found for S3 upload: {local_path}")
 
     bucket = os.environ["AWS_BUCKET_NAME"]
-    region = os.environ.get("AWS_REGION", "ap-south-1")
     key = key.lstrip("/").replace("\\", "/")
 
     if content_type is None:
         content_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
 
-    client = boto3.client(
-        "s3",
-        region_name=region,
-        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-    )
-
+    client = _get_s3_client()
     extra = {
         "ContentType": content_type,
         "CacheControl": "public, max-age=31536000",
@@ -107,8 +131,6 @@ def upload_file_to_s3(local_path: str, key: str, content_type: Optional[str] = N
 
     try:
         client.upload_file(local_path, bucket, key, ExtraArgs=extra)
-        # Confirm object exists
-        client.head_object(Bucket=bucket, Key=key)
     except (BotoCoreError, ClientError) as exc:
         raise RuntimeError(f"S3 upload failed for s3://{bucket}/{key}: {exc}") from exc
 

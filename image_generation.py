@@ -19,9 +19,10 @@ import threading
 import uuid
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from job_runtime import create_job, get_job, submit_job, update_job
 from s3_storage import normalize_user_id, store_generated_media
 
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
@@ -33,26 +34,30 @@ _ALLOWED_QUALITY = {"low", "medium", "high", "auto"}
 router = APIRouter(prefix="/api/image", tags=["image"])
 logger = logging.getLogger(__name__)
 
-# In-memory job store. Swap for Redis/DB if you run multiple server processes.
-_jobs: dict = {}
-_jobs_lock = threading.Lock()
-
-
-def _set_job(job_id: str, **fields):
-    with _jobs_lock:
-        _jobs[job_id].update(fields)
+_openai_client = None
+_openai_client_lock = threading.Lock()
 
 
 def _get_openai_client():
+    """Return a cached OpenAI client (one per process)."""
+    global _openai_client
     from openai import OpenAI
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "Server misconfigured: OPENAI_API_KEY environment variable is not set."
-        )
-    # Image generation can take 30–120s; keep a long read timeout.
-    return OpenAI(api_key=api_key, timeout=180.0, max_retries=2)
+    if _openai_client is not None:
+        return _openai_client
+
+    with _openai_client_lock:
+        if _openai_client is not None:
+            return _openai_client
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "Server misconfigured: OPENAI_API_KEY environment variable is not set."
+            )
+        # Image generation can take 30–120s; keep a long read timeout.
+        _openai_client = OpenAI(api_key=api_key, timeout=180.0, max_retries=2)
+        return _openai_client
 
 
 async def _optional_reference_bytes(upload: Optional[UploadFile]) -> Optional[tuple[bytes, str]]:
@@ -92,7 +97,7 @@ def generate_image(
     prompt: str,
     reference_image_paths: Optional[list] = None,
     size: str = "1536x1024",
-    quality: str = "high",
+    quality: str = "medium",
     output_path: str = "output.png",
 ) -> str:
     """Calls GPT Image 2 and writes the resulting PNG to output_path."""
@@ -145,7 +150,7 @@ def _run_image_job(
     """Background worker: generate image → upload S3 → update job status."""
     output_path = os.path.join(GENERATED_DIR, f"{job_id}.png")
     try:
-        _set_job(job_id, status="processing", progress="Generating image")
+        update_job(job_id, status="processing", progress="Generating image")
 
         generate_image(
             prompt=prompt,
@@ -155,7 +160,7 @@ def _run_image_job(
             output_path=output_path,
         )
 
-        _set_job(job_id, progress="Uploading to S3")
+        update_job(job_id, progress="Uploading to S3")
         public_url, s3_key = store_generated_media(
             local_path=output_path,
             user_id=user_id,
@@ -165,7 +170,7 @@ def _run_image_job(
             delete_local=True,
         )
 
-        _set_job(
+        update_job(
             job_id,
             status="completed",
             progress="Done",
@@ -175,7 +180,7 @@ def _run_image_job(
         )
     except Exception as exc:
         logger.exception("Image job %s failed", job_id)
-        _set_job(job_id, status="failed", error=str(exc), progress=None)
+        update_job(job_id, status="failed", error=str(exc), progress=None)
         if os.path.exists(output_path):
             try:
                 os.remove(output_path)
@@ -211,18 +216,17 @@ class ImageStatusResponse(BaseModel):
 
 @router.post("/generate", response_model=ImageGenerateResponse)
 async def api_generate_image(
-    background_tasks: BackgroundTasks,
     prompt: str = Form(..., description="Image prompt (required)"),
     user_id: str = Form(..., description="Logged-in AdvPost user id"),
     size: str = Form("1536x1024"),
-    quality: str = Form("high"),
+    quality: str = Form("medium"),
     reference_image: Annotated[
         Optional[UploadFile],
         File(description="Optional reference image. Leave empty for prompt-only generation."),
     ] = None,
 ):
     """
-    Starts an async image generation job.
+    Starts an async image generation job on a worker thread.
 
     GPT Image can take 30–120s, which exceeds Cloudflare's proxy timeout when
     done synchronously. Returns a job_id immediately — poll
@@ -232,7 +236,7 @@ async def api_generate_image(
       - prompt (required)
       - user_id (required): logged-in AdvPost user id
       - size: one of 1024x1024, 1536x1024, 1024x1536, auto (default 1536x1024)
-      - quality: one of low, medium, high, auto (default high)
+      - quality: one of low, medium, high, auto (default medium)
       - reference_image: OPTIONAL — omit entirely for text-to-image
     """
     if size not in _ALLOWED_IMAGE_SIZES:
@@ -255,22 +259,21 @@ async def api_generate_image(
         with open(tmp_ref_path, "wb") as f:
             f.write(content)
 
-    with _jobs_lock:
-        _jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "progress": None,
-            "url": None,
-            "filename": None,
-            "s3_key": None,
-            "user_id": uid,
-            "prompt": prompt,
-            "size": size,
-            "quality": quality,
-            "error": None,
-        }
+    create_job(
+        job_id,
+        status="queued",
+        progress=None,
+        url=None,
+        filename=None,
+        s3_key=None,
+        user_id=uid,
+        prompt=prompt,
+        size=size,
+        quality=quality,
+        error=None,
+    )
 
-    background_tasks.add_task(
+    submit_job(
         _run_image_job,
         job_id,
         prompt,
@@ -285,8 +288,20 @@ async def api_generate_image(
 
 @router.get("/status/{job_id}", response_model=ImageStatusResponse)
 async def api_image_status(job_id: str):
-    with _jobs_lock:
-        job = _jobs.get(job_id)
+    job = get_job(job_id)
     if job is None:
         raise HTTPException(404, "job_id not found")
-    return ImageStatusResponse(**job)
+    # Drop internal timestamps from the API response model
+    return ImageStatusResponse(
+        job_id=job["job_id"],
+        status=job.get("status", "queued"),
+        progress=job.get("progress"),
+        url=job.get("url"),
+        filename=job.get("filename"),
+        s3_key=job.get("s3_key"),
+        user_id=job.get("user_id"),
+        prompt=job.get("prompt"),
+        size=job.get("size"),
+        quality=job.get("quality"),
+        error=job.get("error"),
+    )
