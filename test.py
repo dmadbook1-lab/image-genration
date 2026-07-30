@@ -1,12 +1,10 @@
-from google import genai
+"""Quick Vertex auth check using the bundled Veo service-account JSON."""
 
-client = genai.Client(
-    vertexai=True,
-    project="video-generation-veo-502109",
-    location="us-central1",
-)
+from video_generation import _get_genai_clients
 
-response = client.models.generate_content(
+_, gemini_client = _get_genai_clients()
+
+response = gemini_client.models.generate_content(
     model="gemini-2.5-flash",
     contents="Hello, introduce yourself in one sentence.",
 )

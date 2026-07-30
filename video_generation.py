@@ -6,14 +6,12 @@ Exposes:
                 POST /api/video/generate
                 GET  /api/video/status/{job_id}
 
-Required environment variables:
-  GOOGLE_CLOUD_PROJECT
-  GOOGLE_CLOUD_REGION (optional, defaults to "us-central1")
+Auth: service account JSON (default file beside this module). Override with
+  GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
 
-Authenticate locally with Application Default Credentials (recommended):
-  gcloud auth login
-  gcloud config set project <your-project-id>
-  gcloud auth application-default login
+Optional environment variables:
+  GOOGLE_CLOUD_PROJECT  (defaults to project_id inside the SA JSON)
+  GOOGLE_CLOUD_REGION   (defaults to "us-central1")
 
 Also requires the `ffmpeg` binary on the host.
 """
@@ -25,6 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -33,8 +32,12 @@ from pydantic import BaseModel
 from job_runtime import create_job, get_job, submit_job, update_job
 from s3_storage import normalize_user_id, store_generated_media
 
-GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
+_MODULE_DIR = Path(__file__).resolve().parent
+GENERATED_DIR = os.path.join(_MODULE_DIR, "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
+
+# Default Veo service account key shipped with this service.
+_DEFAULT_SA_JSON = _MODULE_DIR / "video-generation-veo-502109-7f1a9e95d0c7.json"
 
 logger = logging.getLogger(__name__)
 
@@ -45,20 +48,73 @@ _ALLOWED_DURATIONS = {8, 16, 30}
 router = APIRouter(prefix="/api/video", tags=["video"])
 
 _genai_clients = None
-_genai_clients_key: Optional[tuple[str, str]] = None
+_genai_clients_key: Optional[tuple[str, str, str]] = None
 _genai_clients_lock = threading.Lock()
+_vertex_credentials = None
+_vertex_credentials_path: Optional[str] = None
+_vertex_credentials_lock = threading.Lock()
+
+
+def _service_account_json_path() -> Path:
+    override = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            path = _MODULE_DIR / path
+        return path.resolve()
+    return _DEFAULT_SA_JSON
+
+
+def _get_vertex_credentials():
+    """Load Vertex credentials from the Veo service-account JSON."""
+    global _vertex_credentials, _vertex_credentials_path
+    from google.oauth2 import service_account
+
+    path = _service_account_json_path()
+    path_str = str(path)
+    if _vertex_credentials is not None and _vertex_credentials_path == path_str:
+        return _vertex_credentials
+
+    with _vertex_credentials_lock:
+        if _vertex_credentials is not None and _vertex_credentials_path == path_str:
+            return _vertex_credentials
+        if not path.is_file():
+            raise RuntimeError(
+                f"GCP service account JSON not found at {path}. "
+                "Place video-generation-veo-502109-7f1a9e95d0c7.json beside "
+                "video_generation.py or set GOOGLE_APPLICATION_CREDENTIALS."
+            )
+        scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+        creds = service_account.Credentials.from_service_account_file(
+            path_str, scopes=scopes
+        )
+        _vertex_credentials = creds
+        _vertex_credentials_path = path_str
+        return _vertex_credentials
+
+
+def _get_vertex_project_id(credentials) -> str:
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+    if project_id:
+        return project_id
+    project_id = getattr(credentials, "project_id", None)
+    if project_id:
+        return project_id
+    raise RuntimeError(
+        "GOOGLE_CLOUD_PROJECT is not set and the service account JSON "
+        "has no project_id."
+    )
 
 
 def _get_genai_clients():
-    """Return cached Vertex GenAI clients; rebuild if project/region change."""
+    """Return cached Vertex GenAI clients authenticated via the SA JSON."""
     global _genai_clients, _genai_clients_key
     from google import genai
 
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    if not project_id:
-        raise RuntimeError("GOOGLE_CLOUD_PROJECT environment variable is not set.")
+    credentials = _get_vertex_credentials()
+    project_id = _get_vertex_project_id(credentials)
     location = os.environ.get("GOOGLE_CLOUD_REGION", "us-central1")
-    key = (project_id, location)
+    key = (project_id, location, _vertex_credentials_path or "")
 
     if _genai_clients is not None and _genai_clients_key == key:
         return _genai_clients
@@ -66,37 +122,106 @@ def _get_genai_clients():
     with _genai_clients_lock:
         if _genai_clients is not None and _genai_clients_key == key:
             return _genai_clients
-        client = genai.Client(vertexai=True, project=project_id, location=location)
-        gemini_client = genai.Client(vertexai=True, project=project_id, location="global")
+        client = genai.Client(
+            vertexai=True,
+            project=project_id,
+            location=location,
+            credentials=credentials,
+        )
+        gemini_client = genai.Client(
+            vertexai=True,
+            project=project_id,
+            location="global",
+            credentials=credentials,
+        )
         _genai_clients = (client, gemini_client)
         _genai_clients_key = key
         return _genai_clients
 
 
 def extract_last_frame(video_path, frame_path):
-    subprocess.run(
-        ["ffmpeg", "-y", "-sseof", "-1", "-i", video_path, "-update", "1", "-q:v", "1", frame_path],
-        check=True,
-        capture_output=True,
+    _run_ffmpeg(
+        [
+            "ffmpeg", "-y", "-sseof", "-1", "-i", video_path,
+            "-update", "1", "-q:v", "1", frame_path,
+        ],
+        label="extract last frame",
     )
 
 
-def concat_and_trim(clip_paths, out_path, target_seconds):
-    list_file = out_path + ".txt"
+def _run_ffmpeg(cmd: list[str], *, label: str) -> None:
+    """Run ffmpeg and raise a readable error with stderr on failure."""
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode == 0:
+        return
+
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+    # FFmpeg often maps ENOSPC (28) to exit 228 (256 - 28).
+    disk_hint = ""
+    if result.returncode in (228, 28) or "No space left" in stderr:
+        disk_hint = " Disk appears full — free space on the server and retry."
+
+    tail = stderr[-800:] if stderr else "(no ffmpeg stderr)"
+    raise RuntimeError(
+        f"ffmpeg {label} failed (exit {result.returncode}).{disk_hint}\n{tail}"
+    )
+
+
+def concat_and_trim(clip_paths, out_path, target_seconds, work_dir=None):
+    """Concatenate segment clips, then trim to target_seconds.
+
+    Prefers stream-copy for speed; falls back to re-encode when codecs differ.
+    Intermediate files stay in work_dir (or next to out_path).
+    """
+    work = work_dir or os.path.dirname(out_path) or "."
+    os.makedirs(work, exist_ok=True)
+
+    list_file = os.path.join(work, "concat_list.txt")
+    concat_path = os.path.join(work, "concat_full.mp4")
+
     with open(list_file, "w") as f:
         for p in clip_paths:
-            f.write(f"file '{os.path.abspath(p)}'\n")
-    concat_path = out_path + "_full.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", concat_path],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", concat_path, "-t", str(target_seconds), "-c", "copy", out_path],
-        check=True,
-        capture_output=True,
-    )
+            # Escape single quotes for the concat demuxer.
+            abs_path = os.path.abspath(p).replace("'", r"'\''")
+            f.write(f"file '{abs_path}'\n")
+
+    copy_cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file, "-c", "copy", concat_path,
+    ]
+    try:
+        _run_ffmpeg(copy_cmd, label="concat (copy)")
+    except RuntimeError as copy_err:
+        # Veo segments can differ in codec/params — re-encode as a fallback.
+        logger.warning("Stream-copy concat failed, re-encoding: %s", copy_err)
+        reencode_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", list_file,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            concat_path,
+        ]
+        _run_ffmpeg(reencode_cmd, label="concat (re-encode)")
+
+    trim_cmd = [
+        "ffmpeg", "-y", "-i", concat_path,
+        "-t", str(target_seconds),
+        "-c", "copy",
+        out_path,
+    ]
+    try:
+        _run_ffmpeg(trim_cmd, label="trim (copy)")
+    except RuntimeError:
+        trim_reencode = [
+            "ffmpeg", "-y", "-i", concat_path,
+            "-t", str(target_seconds),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+        _run_ffmpeg(trim_reencode, label="trim (re-encode)")
 
 
 def _wait_for_video_operation(client, operation, poll_seconds=15, max_wait=900):
@@ -147,7 +272,12 @@ def _download_video_bytes(video) -> bytes:
         bucket_name, _, blob_name = rest.partition("/")
         if not bucket_name or not blob_name:
             raise RuntimeError(f"Invalid GCS URI: {uri}")
-        return storage.Client().bucket(bucket_name).blob(blob_name).download_as_bytes()
+        credentials = _get_vertex_credentials()
+        gcs = storage.Client(
+            project=_get_vertex_project_id(credentials),
+            credentials=credentials,
+        )
+        return gcs.bucket(bucket_name).blob(blob_name).download_as_bytes()
 
     import httpx
 
@@ -156,21 +286,43 @@ def _download_video_bytes(video) -> bytes:
     return response.content
 
 
-def build_prompt(language_name, ad_text, segment_index, covered_context, camera_motion):
+def build_prompt(
+    language_name,
+    ad_text,
+    segment_index,
+    covered_context,
+    camera_motion,
+    starting_image_type="Scene",
+    has_starting_image=False,
+):
+    if has_starting_image:
+        type_label = (starting_image_type or "Scene").strip() or "Scene"
+        assets_block = (
+            f"- The attached image is a {type_label.lower()} — treat it as the "
+            "visual anchor for the first frame / continuity."
+        )
+    else:
+        assets_block = (
+            "- No reference image was provided — invent a cinematic promotional "
+            "scene that fits the ad text (product, storefront, or people as appropriate)."
+        )
+
     if segment_index == 0:
         return f"""
 You are an expert prompt engineer for Google's Veo video model, and a scriptwriter
-for short recruitment/hiring advertisement videos.
+for short promotional / recruitment advertisement videos.
 
-Analyze the attached starting image (a job-recruitment poster/scene) and turn the
-raw job-advertisement text below into ONE cohesive 8-second cinematic Veo prompt.
+Turn the raw advertisement text below into ONE cohesive 8-second cinematic Veo prompt.
+
+Image asset guidance:
+{assets_block}
 
 Requirements:
 - The spoken voiceover/dialogue in the video must be written in {language_name},
-  and should summarize the key hook of the ad (company name, that hiring is open,
-  and urgency) in a natural, energetic recruiter/announcer voice.
+  and should summarize the key hook of the ad (company/brand name, offer or hiring
+  message, and urgency) in a natural, energetic announcer voice.
 - Include the camera motion keyword: {camera_motion}.
-- Describe visual style, setting, motion, and mood, integrating the image's subject.
+- Describe visual style, setting, motion, and mood clearly.
 - Output ONLY the final Veo prompt text (including the {language_name} spoken line
   in quotes), no preamble, no markdown.
 
@@ -179,14 +331,16 @@ Raw ad text:
 """
     return f"""
 You are continuing an 8-second Veo video segment (segment #{segment_index + 1}) of a
-recruitment advertisement. The previous segment ended on the attached frame.
+promotional / recruitment advertisement. The previous segment ended on the attached frame.
 
 Write the next 8-second Veo prompt that continues smoothly from that frame.
 
+Image asset guidance (keep continuity):
+{assets_block}
+
 Requirements:
-- Continue the voiceover in {language_name}, covering the NEXT chunk of the job ad
-  content below that hasn't been spoken yet (e.g. next open positions, salary, or
-  the location/contact number), staying energetic and clear.
+- Continue the voiceover in {language_name}, covering the NEXT chunk of the ad
+  content below that hasn't been spoken yet, staying energetic and clear.
 - Keep visual style/character/setting consistent; camera motion may vary for
   cinematic variety.
 - Output ONLY the final Veo prompt text (including the {language_name} spoken line
@@ -200,26 +354,42 @@ Content already covered so far:
 """
 
 
-def generate_segment(client, gemini_client, gemini_model, video_model, image_path, prompt_text):
+
+def _image_part(path: str):
     from google.genai import types
 
-    with open(image_path, "rb") as f:
+    with open(path, "rb") as f:
         image_bytes = f.read()
-    mime = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+    mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+    return types.Part.from_bytes(data=image_bytes, mime_type=mime)
+
+
+def generate_segment(
+    client,
+    gemini_client,
+    gemini_model,
+    video_model,
+    image_path,
+    prompt_text,
+):
+    from google.genai import types
+
+    contents = [prompt_text]
+    if image_path and os.path.exists(image_path):
+        contents.append(_image_part(image_path))
 
     gem_response = gemini_client.models.generate_content(
         model=gemini_model,
-        contents=[prompt_text, types.Part.from_bytes(data=image_bytes, mime_type=mime)],
+        contents=contents,
     )
     veo_prompt = (gem_response.text or "").strip()
     if not veo_prompt:
         raise RuntimeError("Gemini returned an empty Veo prompt.")
 
-    operation = client.models.generate_videos(
-        model=video_model,
-        prompt=veo_prompt,
-        image=types.Image.from_file(location=image_path),
-        config=types.GenerateVideosConfig(
+    video_kwargs = {
+        "model": video_model,
+        "prompt": veo_prompt,
+        "config": types.GenerateVideosConfig(
             aspect_ratio="16:9",
             number_of_videos=1,
             duration_seconds=SEGMENT_LEN,
@@ -227,7 +397,11 @@ def generate_segment(client, gemini_client, gemini_model, video_model, image_pat
             person_generation="allow_adult",
             generate_audio=True,
         ),
-    )
+    }
+    if image_path and os.path.exists(image_path):
+        video_kwargs["image"] = types.Image.from_file(location=image_path)
+
+    operation = client.models.generate_videos(**video_kwargs)
 
     operation = _wait_for_video_operation(client, operation)
     generated = _video_operation_payload(operation)
@@ -238,14 +412,16 @@ def generate_segment(client, gemini_client, gemini_model, video_model, image_pat
     return video_bytes, veo_prompt
 
 
+
 def _run_video_job(
     job_id: str,
-    starting_image_path: str,
+    starting_image_path: Optional[str],
     ad_text: str,
     language_name: str,
     target_seconds: int,
     camera_motion: str,
     user_id: str,
+    starting_image_type: str = "Scene",
 ):
     gemini_model = "gemini-2.5-flash"
     video_model = "veo-3.1-lite-generate-001"
@@ -255,17 +431,31 @@ def _run_video_job(
         client, gemini_client = _get_genai_clients()
 
         n_segments = max(1, -(-target_seconds // SEGMENT_LEN))  # ceil division
+        has_starting = bool(starting_image_path and os.path.exists(starting_image_path))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             clip_paths = []
             covered_context = ""
-            current_image = starting_image_path
+            current_image = starting_image_path if has_starting else None
 
             for i in range(n_segments):
                 update_job(job_id, progress=f"Generating segment {i + 1}/{n_segments}")
-                prompt_text = build_prompt(language_name, ad_text, i, covered_context, camera_motion)
+                prompt_text = build_prompt(
+                    language_name,
+                    ad_text,
+                    i,
+                    covered_context,
+                    camera_motion,
+                    starting_image_type=starting_image_type,
+                    has_starting_image=bool(current_image and os.path.exists(current_image)),
+                )
                 video_bytes, used_prompt = generate_segment(
-                    client, gemini_client, gemini_model, video_model, current_image, prompt_text
+                    client,
+                    gemini_client,
+                    gemini_model,
+                    video_model,
+                    current_image,
+                    prompt_text,
                 )
 
                 clip_path = os.path.join(tmp_dir, f"seg{i}.mp4")
@@ -284,13 +474,20 @@ def _run_video_job(
             out_path = os.path.join(GENERATED_DIR, filename)
 
             if len(clip_paths) == 1:
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", clip_paths[0], "-t", str(target_seconds), "-c", "copy", out_path],
-                    check=True,
-                    capture_output=True,
+                _run_ffmpeg(
+                    [
+                        "ffmpeg", "-y", "-i", clip_paths[0],
+                        "-t", str(target_seconds), "-c", "copy", out_path,
+                    ],
+                    label="single-clip trim",
                 )
             else:
-                concat_and_trim(clip_paths, out_path, target_seconds)
+                concat_and_trim(
+                    clip_paths,
+                    out_path,
+                    target_seconds,
+                    work_dir=tmp_dir,
+                )
 
         update_job(job_id, progress="Uploading to S3")
         video_url, s3_key = store_generated_media(
@@ -314,8 +511,11 @@ def _run_video_job(
         logger.exception("Video job %s failed", job_id)
         update_job(job_id, status="failed", error=str(exc))
     finally:
-        if os.path.exists(starting_image_path):
-            os.remove(starting_image_path)
+        if starting_image_path and os.path.exists(starting_image_path):
+            try:
+                os.remove(starting_image_path)
+            except OSError:
+                pass
 
 
 class VideoGenerateResponse(BaseModel):
@@ -336,19 +536,21 @@ class VideoStatusResponse(BaseModel):
 
 @router.post("/generate", response_model=VideoGenerateResponse)
 async def api_generate_video(
-    starting_image: UploadFile = File(...),
     ad_text: str = Form(...),
     user_id: str = Form(...),
     language: str = Form("Marathi"),
     duration_seconds: int = Form(30),
     camera_motion: str = Form("Zoom (In)"),
+    starting_image_type: str = Form("Scene"),
+    starting_image: Optional[UploadFile] = File(None),
 ):
     """
     Starts an async video generation job on a worker thread (can take several minutes).
     On completion, stores under users/{user_id}/generated/videos/ on S3.
 
     multipart/form-data fields:
-      - starting_image (required): the first-frame image file
+      - starting_image (optional): first-frame image (Scene/Logo/Character/Product)
+      - starting_image_type: Scene | Logo | Character | Product (default Scene)
       - ad_text (required): raw ad copy to turn into a voiceover script
       - user_id (required): logged-in AdvPost user id
       - language: one of English, Hindi, Marathi (default Marathi)
@@ -363,16 +565,27 @@ async def api_generate_video(
     if duration_seconds not in _ALLOWED_DURATIONS:
         raise HTTPException(400, f"duration_seconds must be one of {sorted(_ALLOWED_DURATIONS)}")
 
+    allowed_types = {"Scene", "Logo", "Character", "Product"}
+    image_type = (starting_image_type or "Scene").strip()
+    if image_type not in allowed_types:
+        raise HTTPException(400, f"starting_image_type must be one of {sorted(allowed_types)}")
+
     try:
         uid = normalize_user_id(user_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
     job_id = uuid.uuid4().hex
-    suffix = os.path.splitext(starting_image.filename or "")[1] or ".jpg"
-    tmp_image_path = os.path.join(tempfile.gettempdir(), f"start_{job_id}{suffix}")
-    with open(tmp_image_path, "wb") as f:
-        f.write(await starting_image.read())
+    tmp_image_path = None
+    if starting_image is not None and starting_image.filename:
+        suffix = os.path.splitext(starting_image.filename or "")[1] or ".jpg"
+        tmp_image_path = os.path.join(tempfile.gettempdir(), f"start_{job_id}{suffix}")
+        data = await starting_image.read()
+        if data:
+            with open(tmp_image_path, "wb") as f:
+                f.write(data)
+        else:
+            tmp_image_path = None
 
     create_job(
         job_id,
@@ -393,6 +606,7 @@ async def api_generate_video(
         duration_seconds,
         camera_motion,
         uid,
+        image_type,
     )
 
     return VideoGenerateResponse(job_id=job_id, status="queued", user_id=uid)

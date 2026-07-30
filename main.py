@@ -6,10 +6,10 @@ Run with:
 
 Required environment variables:
     OPENAI_API_KEY                 - your OpenAI key (DO NOT hardcode it)
-    GOOGLE_CLOUD_PROJECT            - GCP project id used for Veo/Gemini (Vertex AI)
+    GOOGLE_CLOUD_PROJECT            - GCP project for Veo/Gemini (defaults to SA JSON project_id)
     GOOGLE_CLOUD_REGION             - defaults to "us-central1" if unset
-    (optional) GOOGLE_APPLICATION_CREDENTIALS - service account JSON key;
-        for local dev, prefer: gcloud auth application-default login
+    (optional) GOOGLE_APPLICATION_CREDENTIALS - override path to SA JSON;
+        default: video-generation-veo-502109-7f1a9e95d0c7.json beside this service
 
 Optional tuning:
     MEDIA_MAX_WORKERS               - concurrent image/video jobs (default 3)

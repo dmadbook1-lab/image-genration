@@ -36,10 +36,9 @@ Optional performance tuning in `.env`:
 
 Jobs run on a thread pool so `/health` and `/status` stay responsive while generation is in progress.
 
-Note: the original notebook used `google.colab.auth.authenticate_user()`. That
-only works inside Colab. On a real server, authenticate via a GCP **service
-account** JSON key (set `GOOGLE_APPLICATION_CREDENTIALS`) or Workload Identity
-if deployed on GCP.
+Video auth uses the bundled GCP **service account** JSON
+(`video-generation-veo-502109-7f1a9e95d0c7.json`). Override the path with
+`GOOGLE_APPLICATION_CREDENTIALS` if needed. No `gcloud auth` login is required.
 
 ---
 
