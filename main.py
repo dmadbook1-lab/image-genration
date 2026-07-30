@@ -44,6 +44,8 @@ app = FastAPI(title="Media Generation API", version="1.0.0")
 
 # Allow your Flutter app (web/mobile/desktop) to call this API during dev.
 # Lock this down to your actual domains before shipping to production.
+
+# Allow only requests from the specified origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
