@@ -67,14 +67,26 @@ app.include_router(video_router)
 async def on_startup():
     # Warm the shared executor so first job doesn't pay setup cost on request path.
     from job_runtime import get_executor
+    from video_generation import ffmpeg_available
 
     get_executor()
+    if not ffmpeg_available():
+        logger.error(
+            "ffmpeg binary not found on PATH — video jobs will fail. "
+            "Install ffmpeg on this host (e.g. apt-get install ffmpeg)."
+        )
     logger.info(
-        "Media Generation API ready (MEDIA_MAX_WORKERS=%s)",
+        "Media Generation API ready (MEDIA_MAX_WORKERS=%s, ffmpeg=%s)",
         os.environ.get("MEDIA_MAX_WORKERS", "3"),
+        "ok" if ffmpeg_available() else "MISSING",
     )
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    from video_generation import ffmpeg_available
+
+    return {
+        "status": "ok",
+        "ffmpeg": "ok" if ffmpeg_available() else "missing",
+    }

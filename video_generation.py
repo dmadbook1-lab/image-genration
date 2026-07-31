@@ -139,6 +139,13 @@ def _get_genai_clients():
         return _genai_clients
 
 
+def ffmpeg_available() -> bool:
+    """True if the ffmpeg binary is on PATH."""
+    from shutil import which
+
+    return which("ffmpeg") is not None
+
+
 def extract_last_frame(video_path, frame_path):
     _run_ffmpeg(
         [
@@ -151,7 +158,17 @@ def extract_last_frame(video_path, frame_path):
 
 def _run_ffmpeg(cmd: list[str], *, label: str) -> None:
     """Run ffmpeg and raise a readable error with stderr on failure."""
-    result = subprocess.run(cmd, capture_output=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "ffmpeg is not installed on this server (or not on PATH). "
+            "Install it and restart the service — "
+            "Ubuntu/Debian: sudo apt-get install -y ffmpeg | "
+            "RHEL/Amazon Linux: sudo yum install -y ffmpeg | "
+            "macOS: brew install ffmpeg"
+        ) from exc
+
     if result.returncode == 0:
         return
 

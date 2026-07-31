@@ -57,6 +57,11 @@ htmlcov/
 .env
 .env.*
 
+# GCP service account credentials (never commit)
+video-generation-veo-502109-7f1a9e95d0c7.json
+*-credentials.json
+*service-account*.json
+
 # SQLite
 *.sqlite3
 db.sqlite3
