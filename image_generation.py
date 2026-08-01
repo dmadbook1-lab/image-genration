@@ -145,16 +145,17 @@ def _run_image_job(
     size: str,
     quality: str,
     user_id: str,
-    reference_image_path: Optional[str] = None,
+    reference_image_paths: Optional[list] = None,
 ):
     """Background worker: generate image → upload S3 → update job status."""
     output_path = os.path.join(GENERATED_DIR, f"{job_id}.png")
+    reference_image_paths = reference_image_paths or []
     try:
         update_job(job_id, status="processing", progress="Generating image")
 
         generate_image(
             prompt=prompt,
-            reference_image_paths=[reference_image_path] if reference_image_path else None,
+            reference_image_paths=reference_image_paths,
             size=size,
             quality=quality,
             output_path=output_path,
@@ -187,11 +188,12 @@ def _run_image_job(
             except OSError:
                 pass
     finally:
-        if reference_image_path and os.path.exists(reference_image_path):
-            try:
-                os.remove(reference_image_path)
-            except OSError:
-                pass
+        for ref_path in reference_image_paths:
+            if ref_path and os.path.exists(ref_path):
+                try:
+                    os.remove(ref_path)
+                except OSError:
+                    pass
 
 
 class ImageGenerateResponse(BaseModel):
@@ -214,15 +216,43 @@ class ImageStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+_MAX_PRODUCT_IMAGES = 4
+
+
+def _palette_prompt_block(color_palette: str) -> str:
+    """Build a strict palette instruction from a comma-separated hex list."""
+    colors = [c.strip() for c in color_palette.split(",") if c.strip()]
+    if not colors:
+        return ""
+    return (
+        "\n\nCOLOR PALETTE (strict):\n"
+        f"Use exactly this color palette for the poster: {', '.join(colors)}. "
+        "Use the first color as the dominant/brand color and the rest as "
+        "supporting/background/accent colors. Do not introduce clashing colors."
+    )
+
+
 @router.post("/generate", response_model=ImageGenerateResponse)
 async def api_generate_image(
     prompt: str = Form(..., description="Image prompt (required)"),
     user_id: str = Form(..., description="Logged-in AdvPost user id"),
     size: str = Form("1536x1024"),
     quality: str = Form("medium"),
+    color_palette: str = Form(
+        "",
+        description="Optional comma-separated hex colors, e.g. #7C3AED,#C4B5FD,#1E1B4B",
+    ),
+    logo_image: Annotated[
+        Optional[UploadFile],
+        File(description="Optional business logo (placed as brand mark, never redrawn)."),
+    ] = None,
+    product_images: Annotated[
+        Optional[list[UploadFile]],
+        File(description="Optional product photos (up to 4) used as hero visuals."),
+    ] = None,
     reference_image: Annotated[
         Optional[UploadFile],
-        File(description="Optional reference image. Leave empty for prompt-only generation."),
+        File(description="Optional generic reference image (legacy field)."),
     ] = None,
 ):
     """
@@ -237,7 +267,10 @@ async def api_generate_image(
       - user_id (required): logged-in AdvPost user id
       - size: one of 1024x1024, 1536x1024, 1024x1536, auto (default 1536x1024)
       - quality: one of low, medium, high, auto (default medium)
-      - reference_image: OPTIONAL — omit entirely for text-to-image
+      - color_palette: OPTIONAL comma-separated hex colors for the poster
+      - logo_image: OPTIONAL business logo file
+      - product_images: OPTIONAL product photos (repeat field, up to 4)
+      - reference_image: OPTIONAL legacy generic reference image
     """
     if size not in _ALLOWED_IMAGE_SIZES:
         raise HTTPException(400, f"size must be one of {sorted(_ALLOWED_IMAGE_SIZES)}")
@@ -250,14 +283,31 @@ async def api_generate_image(
         raise HTTPException(400, str(exc)) from exc
 
     job_id = uuid.uuid4().hex
-    tmp_ref_path = None
 
-    ref = await _optional_reference_bytes(reference_image)
-    if ref is not None:
-        content, suffix = ref
-        tmp_ref_path = os.path.join(tempfile.gettempdir(), f"ref_{job_id}{suffix}")
-        with open(tmp_ref_path, "wb") as f:
+    # Attachment order matters and is described to the model in the prompt:
+    # logo first, then product photos, then any legacy reference image.
+    ref_paths: list[str] = []
+
+    async def _save_upload(upload: Optional[UploadFile], tag: str) -> None:
+        data = await _optional_reference_bytes(upload)
+        if data is None:
+            return
+        content, suffix = data
+        path = os.path.join(
+            tempfile.gettempdir(), f"{tag}_{job_id}_{len(ref_paths)}{suffix}"
+        )
+        with open(path, "wb") as f:
             f.write(content)
+        ref_paths.append(path)
+
+    await _save_upload(logo_image, "logo")
+    for product in (product_images or [])[:_MAX_PRODUCT_IMAGES]:
+        await _save_upload(product, "product")
+    await _save_upload(reference_image, "ref")
+
+    final_prompt = prompt
+    if color_palette.strip():
+        final_prompt = f"{prompt}{_palette_prompt_block(color_palette)}"
 
     create_job(
         job_id,
@@ -267,7 +317,7 @@ async def api_generate_image(
         filename=None,
         s3_key=None,
         user_id=uid,
-        prompt=prompt,
+        prompt=final_prompt,
         size=size,
         quality=quality,
         error=None,
@@ -276,11 +326,11 @@ async def api_generate_image(
     submit_job(
         _run_image_job,
         job_id,
-        prompt,
+        final_prompt,
         size,
         quality,
         uid,
-        tmp_ref_path,
+        ref_paths,
     )
 
     return ImageGenerateResponse(job_id=job_id, status="queued", user_id=uid)

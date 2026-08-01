@@ -303,6 +303,20 @@ def _download_video_bytes(video) -> bytes:
     return response.content
 
 
+_SAFETY_RULES = """
+CRITICAL SAFETY / RAI RULES (must follow — Veo blocks photorealistic people):
+- Do NOT depict any human faces, celebrities, public figures, children, or
+  photorealistic people of any kind.
+- Prefer: products, packaging, storefronts, interiors, food, logos as graphics,
+  text overlays, hands-only close-ups (no face), city/street atmosphere without
+  identifiable faces, abstract motion graphics.
+- Never name or describe a real person. Never invent celebrity look-alikes.
+- Keep the ad family-friendly: no violence, weapons, sexual content, alcohol
+  abuse, drugs, hate, or political content.
+- Voiceover may be an off-screen announcer — do not show the speaker on camera.
+""".strip()
+
+
 def build_prompt(
     language_name,
     ad_text,
@@ -311,17 +325,53 @@ def build_prompt(
     camera_motion,
     starting_image_type="Scene",
     has_starting_image=False,
+    is_final_segment=True,
+    safe_mode=False,
 ):
     if has_starting_image:
         type_label = (starting_image_type or "Scene").strip() or "Scene"
         assets_block = (
             f"- The attached image is a {type_label.lower()} — treat it as the "
-            "visual anchor for the first frame / continuity."
+            "visual anchor for the first frame / continuity. If it contains a "
+            "person or face, reinterpret it as a logo/product graphic only and "
+            "do not animate a photorealistic person."
         )
     else:
         assets_block = (
             "- No reference image was provided — invent a cinematic promotional "
-            "scene that fits the ad text (product, storefront, or people as appropriate)."
+            "scene with products, storefront, packaging, or motion graphics "
+            "(NO people / NO faces)."
+        )
+
+    brief_rules = """
+The advertisement brief below may be a structured brief with labeled sections
+(BUSINESS DETAILS, AD MESSAGE, VISUAL STYLE, CONTACT DETAILS) or plain ad text.
+Honor every section that is present:
+- BUSINESS DETAILS: mention the business name in the voiceover; let the category,
+  purpose, and target audience shape the scene, tone, and wording.
+- AD MESSAGE: this is the core of the voiceover script. If it asks you to write
+  the script yourself, write a compelling one from the business details.
+- VISUAL STYLE: follow this style/mood with products and environments only
+  (never add people to make a style feel "friendly").
+- CONTACT DETAILS: work them into the closing call-to-action (spoken naturally)
+  and describe clean on-screen text overlays showing them near the end of the
+  video. Reproduce phone numbers, websites, and addresses EXACTLY as written —
+  never invent or alter contact information.""".strip()
+
+    safe_extra = ""
+    if safe_mode:
+        safe_extra = (
+            "\nSAFE RETRY MODE: Previous attempt was blocked by Vertex AI safety "
+            "filters. Rewrite as a purely product / storefront / text-overlay "
+            "commercial with ZERO humans, faces, or celebrity likenesses.\n"
+        )
+
+    final_rule = ""
+    if is_final_segment:
+        final_rule = (
+            "- This is the FINAL segment: end with a strong call-to-action, and "
+            "if the brief has CONTACT DETAILS, speak them naturally and show "
+            "them as clean on-screen text.\n"
         )
 
     if segment_index == 0:
@@ -329,7 +379,11 @@ def build_prompt(
 You are an expert prompt engineer for Google's Veo video model, and a scriptwriter
 for short promotional / recruitment advertisement videos.
 
-Turn the raw advertisement text below into ONE cohesive 8-second cinematic Veo prompt.
+Turn the advertisement brief below into ONE cohesive 8-second cinematic Veo prompt.
+
+{_SAFETY_RULES}
+{safe_extra}
+{brief_rules}
 
 Image asset guidance:
 {assets_block}
@@ -337,13 +391,13 @@ Image asset guidance:
 Requirements:
 - The spoken voiceover/dialogue in the video must be written in {language_name},
   and should summarize the key hook of the ad (company/brand name, offer or hiring
-  message, and urgency) in a natural, energetic announcer voice.
+  message, and urgency) in a natural, energetic announcer voice (off-screen).
 - Include the camera motion keyword: {camera_motion}.
-- Describe visual style, setting, motion, and mood clearly.
-- Output ONLY the final Veo prompt text (including the {language_name} spoken line
+- Describe visual style, setting, motion, and mood clearly — products and places only.
+{final_rule}- Output ONLY the final Veo prompt text (including the {language_name} spoken line
   in quotes), no preamble, no markdown.
 
-Raw ad text:
+Advertisement brief:
 \"\"\"{ad_text}\"\"\"
 """
     return f"""
@@ -352,24 +406,27 @@ promotional / recruitment advertisement. The previous segment ended on the attac
 
 Write the next 8-second Veo prompt that continues smoothly from that frame.
 
+{_SAFETY_RULES}
+{safe_extra}
+{brief_rules}
+
 Image asset guidance (keep continuity):
 {assets_block}
 
 Requirements:
 - Continue the voiceover in {language_name}, covering the NEXT chunk of the ad
   content below that hasn't been spoken yet, staying energetic and clear.
-- Keep visual style/character/setting consistent; camera motion may vary for
-  cinematic variety.
+{final_rule}- Keep visual style/setting consistent; camera motion may vary for
+  cinematic variety. Still NO people or faces.
 - Output ONLY the final Veo prompt text (including the {language_name} spoken line
   in quotes), no preamble, no markdown.
 
-Full ad text for reference (avoid repeating lines already used):
+Full advertisement brief for reference (avoid repeating lines already used):
 \"\"\"{ad_text}\"\"\"
 
 Content already covered so far:
 {covered_context}
 """
-
 
 
 def _image_part(path: str):
@@ -381,16 +438,12 @@ def _image_part(path: str):
     return types.Part.from_bytes(data=image_bytes, mime_type=mime)
 
 
-def generate_segment(
-    client,
-    gemini_client,
-    gemini_model,
-    video_model,
-    image_path,
-    prompt_text,
-):
-    from google.genai import types
+def _is_rai_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "rai" in msg or "usage guidelines" in msg or "filtered out" in msg
 
+
+def _gemini_veo_prompt(gemini_client, gemini_model, prompt_text, image_path=None) -> str:
     contents = [prompt_text]
     if image_path and os.path.exists(image_path):
         contents.append(_image_part(image_path))
@@ -402,6 +455,11 @@ def generate_segment(
     veo_prompt = (gem_response.text or "").strip()
     if not veo_prompt:
         raise RuntimeError("Gemini returned an empty Veo prompt.")
+    return veo_prompt
+
+
+def _call_veo(client, video_model, veo_prompt, image_path=None):
+    from google.genai import types
 
     video_kwargs = {
         "model": video_model,
@@ -411,7 +469,9 @@ def generate_segment(
             number_of_videos=1,
             duration_seconds=SEGMENT_LEN,
             resolution="1080p",
-            person_generation="allow_adult",
+            # Photorealistic people trigger celebrity/person RAI filters
+            # (support code 15236754) on many Vertex projects.
+            person_generation="dont_allow",
             generate_audio=True,
         ),
     }
@@ -419,14 +479,66 @@ def generate_segment(
         video_kwargs["image"] = types.Image.from_file(location=image_path)
 
     operation = client.models.generate_videos(**video_kwargs)
-
     operation = _wait_for_video_operation(client, operation)
     generated = _video_operation_payload(operation)
     if generated.video is None:
         raise RuntimeError("Generated video entry is missing video data.")
+    return _download_video_bytes(generated.video)
 
-    video_bytes = _download_video_bytes(generated.video)
-    return video_bytes, veo_prompt
+
+def generate_segment(
+    client,
+    gemini_client,
+    gemini_model,
+    video_model,
+    image_path,
+    prompt_text,
+    *,
+    safe_retry_prompt_builder=None,
+):
+    """Generate one Veo segment. On RAI filter, auto-retry with a safer prompt
+    (and without the starting image if needed).
+    """
+    veo_prompt = _gemini_veo_prompt(
+        gemini_client, gemini_model, prompt_text, image_path=image_path
+    )
+    logger.info("Veo prompt (first attempt): %s", veo_prompt[:500])
+
+    try:
+        video_bytes = _call_veo(client, video_model, veo_prompt, image_path=image_path)
+        return video_bytes, veo_prompt
+    except Exception as first_err:
+        if not _is_rai_error(first_err):
+            raise
+        logger.warning("Veo RAI filter hit; retrying with safer no-people prompt: %s", first_err)
+
+    # Retry 1: safer Gemini rewrite, keep image
+    if safe_retry_prompt_builder is not None:
+        safe_prompt_text = safe_retry_prompt_builder()
+    else:
+        safe_prompt_text = (
+            prompt_text
+            + "\n\nSAFE RETRY: rewrite with ZERO humans/faces; products and "
+            "storefronts only."
+        )
+    veo_prompt = _gemini_veo_prompt(
+        gemini_client, gemini_model, safe_prompt_text, image_path=None
+    )
+    logger.info("Veo prompt (safe retry): %s", veo_prompt[:500])
+
+    try:
+        video_bytes = _call_veo(client, video_model, veo_prompt, image_path=None)
+        return video_bytes, veo_prompt
+    except Exception as second_err:
+        if not _is_rai_error(second_err):
+            raise
+        logger.warning("Veo RAI filter hit again on safe retry: %s", second_err)
+        raise RuntimeError(
+            "Video was blocked by Vertex AI safety filters (often for "
+            "photorealistic people / celebrity likeness). Try again with a "
+            "product or storefront image, avoid describing people, and keep "
+            "the ad message family-friendly."
+        ) from second_err
 
 
 
@@ -457,15 +569,23 @@ def _run_video_job(
 
             for i in range(n_segments):
                 update_job(job_id, progress=f"Generating segment {i + 1}/{n_segments}")
-                prompt_text = build_prompt(
-                    language_name,
-                    ad_text,
-                    i,
-                    covered_context,
-                    camera_motion,
+                prompt_kwargs = dict(
+                    language_name=language_name,
+                    ad_text=ad_text,
+                    segment_index=i,
+                    covered_context=covered_context,
+                    camera_motion=camera_motion,
                     starting_image_type=starting_image_type,
                     has_starting_image=bool(current_image and os.path.exists(current_image)),
+                    is_final_segment=(i == n_segments - 1),
                 )
+                prompt_text = build_prompt(**prompt_kwargs)
+
+                def _safe_builder(
+                    _kwargs=prompt_kwargs,
+                ):
+                    return build_prompt(**{**_kwargs, "safe_mode": True, "has_starting_image": False})
+
                 video_bytes, used_prompt = generate_segment(
                     client,
                     gemini_client,
@@ -473,6 +593,7 @@ def _run_video_job(
                     video_model,
                     current_image,
                     prompt_text,
+                    safe_retry_prompt_builder=_safe_builder,
                 )
 
                 clip_path = os.path.join(tmp_dir, f"seg{i}.mp4")
