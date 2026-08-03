@@ -316,6 +316,27 @@ CRITICAL SAFETY / RAI RULES (must follow — Veo blocks photorealistic people):
 - Voiceover may be an off-screen announcer — do not show the speaker on camera.
 """.strip()
 
+_MOTION_RULES_TEMPLATE = """
+MOTION REQUIREMENTS (critical — the previous videos were coming out too static):
+- The video must show continuous, visible motion for the FULL 8 seconds, not one
+  frozen composition with a voiceover played over it.
+- Camera motion for this segment: {camera_motion}. If this is "Static Shot" or
+  "fixed", treat it as meaning the camera rig doesn't move — it does NOT mean the
+  scene is frozen. You must still animate the scene itself.
+- In addition to (or instead of) camera movement, describe specific in-scene
+  motion appropriate to the brief: product rotating or being picked up/opened,
+  liquid pouring, steam rising, packaging unboxing, fabric or hair-free motion
+  graphics, light/reflections shifting, particles or dust in the air, screens or
+  UI elements animating, text overlays sliding/fading in, vehicles or machinery
+  moving, storefront signage lighting up, etc. Pick 1-2 that fit the business.
+- Include at least one visible change over the 8 seconds — a shift in framing,
+  distance, subject focus, or a clear beat/transition (e.g. "opens on a wide
+  shot of the storefront, then pushes in as the product is revealed on the
+  counter") — never one static, held, or frozen composition throughout.
+- Do not use the words "static," "frozen," "still," or "held" to describe the
+  overall shot — only ever to describe camera rig stability, if at all.
+""".strip()
+
 
 def build_prompt(
     language_name,
@@ -366,6 +387,10 @@ Honor every section that is present:
             "commercial with ZERO humans, faces, or celebrity likenesses.\n"
         )
 
+    # FIX: this must be computed unconditionally (not inside `if is_final_segment`)
+    # since it's referenced by every return branch below, for every segment.
+    motion_rules = _MOTION_RULES_TEMPLATE.format(camera_motion=camera_motion)
+
     final_rule = ""
     if is_final_segment:
         final_rule = (
@@ -392,8 +417,8 @@ Requirements:
 - The spoken voiceover/dialogue in the video must be written in {language_name},
   and should summarize the key hook of the ad (company/brand name, offer or hiring
   message, and urgency) in a natural, energetic announcer voice (off-screen).
-- Include the camera motion keyword: {camera_motion}.
-- Describe visual style, setting, motion, and mood clearly — products and places only.
+{motion_rules}
+- Describe visual style, setting, and mood clearly — products and places only.
 {final_rule}- Output ONLY the final Veo prompt text (including the {language_name} spoken line
   in quotes), no preamble, no markdown.
 
@@ -416,8 +441,8 @@ Image asset guidance (keep continuity):
 Requirements:
 - Continue the voiceover in {language_name}, covering the NEXT chunk of the ad
   content below that hasn't been spoken yet, staying energetic and clear.
-{final_rule}- Keep visual style/setting consistent; camera motion may vary for
-  cinematic variety. Still NO people or faces.
+{final_rule}{motion_rules}
+- Keep visual style/setting consistent across segments. Still NO people or faces.
 - Output ONLY the final Veo prompt text (including the {language_name} spoken line
   in quotes), no preamble, no markdown.
 
@@ -427,7 +452,6 @@ Full advertisement brief for reference (avoid repeating lines already used):
 Content already covered so far:
 {covered_context}
 """
-
 
 def _image_part(path: str):
     from google.genai import types
