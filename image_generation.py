@@ -20,7 +20,7 @@ import uuid
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator, WithJsonSchema
 
 from job_runtime import create_job, get_job, submit_job, update_job
 from s3_storage import normalize_user_id, store_generated_media
@@ -30,6 +30,7 @@ os.makedirs(GENERATED_DIR, exist_ok=True)
 
 _ALLOWED_IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}
 _ALLOWED_QUALITY = {"low", "medium", "high", "auto"}
+_MAX_LANGUAGE_LEN = 64
 
 router = APIRouter(prefix="/api/image", tags=["image"])
 logger = logging.getLogger(__name__)
@@ -213,10 +214,56 @@ class ImageStatusResponse(BaseModel):
     prompt: Optional[str] = None
     size: Optional[str] = None
     quality: Optional[str] = None
+    language: Optional[str] = None
     error: Optional[str] = None
 
 
 _MAX_PRODUCT_IMAGES = 4
+
+# Swagger UI only renders "Choose file" for format:binary. FastAPI 0.129+ emits
+# OAS 3.1 contentMediaType for UploadFile, which makes list[UploadFile] show as
+# text inputs ("Add string item") instead of file pickers.
+
+
+def _coerce_optional_upload(value):
+    """Treat Swagger/curl empty file fields ('') as missing."""
+    if value is None or value == "" or isinstance(value, str):
+        return None
+    return value
+
+
+def _coerce_upload_list(value):
+    """
+    Swagger 'Send empty value' / curl -F 'product_images=' sends '' which
+    becomes ['']. Drop non-file placeholders so validation does not 422.
+    """
+    if value is None or value == "":
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    return [
+        item
+        for item in value
+        if item is not None and not isinstance(item, str) and item != ""
+    ]
+
+
+_OptionalUpload = Annotated[
+    Optional[UploadFile],
+    BeforeValidator(_coerce_optional_upload),
+    WithJsonSchema({"type": "string", "format": "binary"}),
+]
+
+_ProductUploadList = Annotated[
+    list[UploadFile],
+    BeforeValidator(_coerce_upload_list),
+    WithJsonSchema(
+        {
+            "type": "array",
+            "items": {"type": "string", "format": "binary"},
+        }
+    ),
+]
 
 
 def _palette_prompt_block(color_palette: str) -> str:
@@ -232,26 +279,104 @@ def _palette_prompt_block(color_palette: str) -> str:
     )
 
 
+def _language_prompt_block(language: str) -> str:
+    """Build a strict on-image text language instruction for any language."""
+    return (
+        f"\n\nLANGUAGE (strict — highest priority):\n"
+        f"Target language: {language}.\n"
+        f"- Every piece of readable text in the image (headlines, slogans, offers, "
+        f"CTAs, labels, captions, prices, dates, and body copy) MUST be written "
+        f"only in {language}, using the correct native script for that language.\n"
+        f"- If the prompt or product copy is in another language, translate it "
+        f"naturally into {language} before rendering it on the image.\n"
+        f"- Do not mix languages. Do not leave leftover English (or any other "
+        f"language) text on the poster unless the target language itself is that "
+        f"language.\n"
+        f"- Brand names and logos may stay as provided / as shown in reference "
+        f"images; everything else must be {language} only."
+    )
+
+
+def _reference_assets_prompt_block(
+    *,
+    has_logo: bool,
+    product_count: int,
+    has_legacy_ref: bool,
+) -> str:
+    """
+    Describe attached reference files and force flexible product placement.
+
+    Without this, images.edit often pastes the product stuck on the left.
+    """
+    if not has_logo and product_count <= 0 and not has_legacy_ref:
+        return ""
+
+    lines = [
+        "\n\nATTACHED REFERENCE IMAGES (in order):",
+    ]
+    idx = 1
+    if has_logo:
+        lines.append(
+            f"- Image {idx}: BUSINESS LOGO — place as a small brand mark "
+            f"(typically corner). Keep the logo recognizable; do not redraw "
+            f"or invent a different logo."
+        )
+        idx += 1
+    for i in range(product_count):
+        lines.append(
+            f"- Image {idx}: PRODUCT PHOTO {i + 1} — use the real product "
+            f"appearance as a hero visual. Keep product shape, packaging, "
+            f"colors, and labels faithful to the photo."
+        )
+        idx += 1
+    if has_legacy_ref:
+        lines.append(
+            f"- Image {idx}: STYLE/REFERENCE image — use only for mood, "
+            f"palette, or composition inspiration."
+        )
+
+    lines.append(
+        "\nPRODUCT PLACEMENT (strict — do NOT default to left side):\n"
+        "- Freely plan the layout. Place product(s) wherever best fits a strong "
+        "ad composition: center, right, bottom, top, foreground, slight angle, "
+        "or integrated into the scene — NOT locked to the left half.\n"
+        "- Vary position and scale across designs. Do not paste the product "
+        "as a fixed left-column cutout or mirrored collage.\n"
+        "- Balance text and product so neither is cramped. Leave clear space "
+        "for headlines/CTAs opposite or around the product.\n"
+        "- Composite the product naturally into the poster (lighting, shadow, "
+        "perspective) so it looks designed-in, not stuck on."
+    )
+    return "\n".join(lines)
+
+
 @router.post("/generate", response_model=ImageGenerateResponse)
 async def api_generate_image(
     prompt: str = Form(..., description="Image prompt (required)"),
     user_id: str = Form(..., description="Logged-in AdvPost user id"),
     size: str = Form("1536x1024"),
     quality: str = Form("medium"),
+    language: str = Form(
+        "Marathi",
+        description=(
+            "Language for all on-image text (any language name, e.g. English, "
+            "Hindi, Marathi, Tamil, Spanish). Default: Marathi"
+        ),
+    ),
     color_palette: str = Form(
         "",
         description="Optional comma-separated hex colors, e.g. #7C3AED,#C4B5FD,#1E1B4B",
     ),
     logo_image: Annotated[
-        Optional[UploadFile],
+        _OptionalUpload,
         File(description="Optional business logo (placed as brand mark, never redrawn)."),
     ] = None,
     product_images: Annotated[
-        Optional[list[UploadFile]],
+        _ProductUploadList,
         File(description="Optional product photos (up to 4) used as hero visuals."),
-    ] = None,
+    ] = [],
     reference_image: Annotated[
-        Optional[UploadFile],
+        _OptionalUpload,
         File(description="Optional generic reference image (legacy field)."),
     ] = None,
 ):
@@ -267,6 +392,7 @@ async def api_generate_image(
       - user_id (required): logged-in AdvPost user id
       - size: one of 1024x1024, 1536x1024, 1024x1536, auto (default 1536x1024)
       - quality: one of low, medium, high, auto (default medium)
+      - language: any language name for on-image text (default Marathi)
       - color_palette: OPTIONAL comma-separated hex colors for the poster
       - logo_image: OPTIONAL business logo file
       - product_images: OPTIONAL product photos (repeat field, up to 4)
@@ -276,6 +402,12 @@ async def api_generate_image(
         raise HTTPException(400, f"size must be one of {sorted(_ALLOWED_IMAGE_SIZES)}")
     if quality not in _ALLOWED_QUALITY:
         raise HTTPException(400, f"quality must be one of {sorted(_ALLOWED_QUALITY)}")
+    language = language.strip()
+    if not language or len(language) > _MAX_LANGUAGE_LEN:
+        raise HTTPException(
+            400,
+            f"language must be a non-empty name up to {_MAX_LANGUAGE_LEN} characters",
+        )
 
     try:
         uid = normalize_user_id(user_id)
@@ -287,11 +419,14 @@ async def api_generate_image(
     # Attachment order matters and is described to the model in the prompt:
     # logo first, then product photos, then any legacy reference image.
     ref_paths: list[str] = []
+    has_logo = False
+    product_count = 0
+    has_legacy_ref = False
 
-    async def _save_upload(upload: Optional[UploadFile], tag: str) -> None:
+    async def _save_upload(upload: Optional[UploadFile], tag: str) -> bool:
         data = await _optional_reference_bytes(upload)
         if data is None:
-            return
+            return False
         content, suffix = data
         path = os.path.join(
             tempfile.gettempdir(), f"{tag}_{job_id}_{len(ref_paths)}{suffix}"
@@ -299,15 +434,29 @@ async def api_generate_image(
         with open(path, "wb") as f:
             f.write(content)
         ref_paths.append(path)
+        return True
 
-    await _save_upload(logo_image, "logo")
-    for product in (product_images or [])[:_MAX_PRODUCT_IMAGES]:
-        await _save_upload(product, "product")
-    await _save_upload(reference_image, "ref")
+    if await _save_upload(logo_image, "logo"):
+        has_logo = True
+    for product in product_images[:_MAX_PRODUCT_IMAGES]:
+        if await _save_upload(product, "product"):
+            product_count += 1
+    if await _save_upload(reference_image, "ref"):
+        has_legacy_ref = True
 
-    final_prompt = prompt
+    # Language + layout first so the model treats them as hard constraints.
+    prompt_parts = [_language_prompt_block(language).strip()]
+    assets_block = _reference_assets_prompt_block(
+        has_logo=has_logo,
+        product_count=product_count,
+        has_legacy_ref=has_legacy_ref,
+    ).strip()
+    if assets_block:
+        prompt_parts.append(assets_block)
+    prompt_parts.append(prompt.strip())
+    final_prompt = "\n\n".join(prompt_parts)
     if color_palette.strip():
-        final_prompt = f"{prompt}{_palette_prompt_block(color_palette)}"
+        final_prompt = f"{final_prompt}{_palette_prompt_block(color_palette)}"
 
     create_job(
         job_id,
@@ -320,6 +469,7 @@ async def api_generate_image(
         prompt=final_prompt,
         size=size,
         quality=quality,
+        language=language,
         error=None,
     )
 
@@ -353,5 +503,6 @@ async def api_image_status(job_id: str):
         prompt=job.get("prompt"),
         size=job.get("size"),
         quality=job.get("quality"),
+        language=job.get("language"),
         error=job.get("error"),
     )

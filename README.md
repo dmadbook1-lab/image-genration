@@ -63,7 +63,11 @@ Content-Type: `multipart/form-data`
 | `user_id` | string | yes | logged-in AdvPost user id (S3 folder) |
 | `size` | string | no | `1024x1024` \| `1536x1024` \| `1024x1536` \| `auto` (default `1536x1024`) |
 | `quality` | string | no | `low` \| `medium` \| `high` \| `auto` (default `medium`) |
-| `reference_image` | file | no | optional reference image to edit from |
+| `language` | string | no | any language name for on-image text (default `Marathi`), e.g. `English`, `Hindi`, `Tamil`, `Spanish` |
+| `color_palette` | string | no | comma-separated hex colors, e.g. `#7C3AED,#C4B5FD` |
+| `logo_image` | file | no | business logo (placed as brand mark) |
+| `product_images` | file(s) | no | product photos (up to 4) |
+| `reference_image` | file | no | optional legacy reference image |
 
 **Response `200`:**
 ```json
