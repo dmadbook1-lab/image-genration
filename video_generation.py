@@ -241,7 +241,7 @@ def concat_and_trim(clip_paths, out_path, target_seconds, work_dir=None):
         _run_ffmpeg(trim_reencode, label="trim (re-encode)")
 
 
-def _wait_for_video_operation(client, operation, poll_seconds=15, max_wait=900):
+def _wait_for_video_operation(client, operation, poll_seconds=8, max_wait=900):
     elapsed = 0
     while not operation.done:
         if elapsed >= max_wait:
@@ -485,14 +485,15 @@ def _gemini_veo_prompt(gemini_client, gemini_model, prompt_text, image_path=None
 def _call_veo(client, video_model, veo_prompt, image_path=None):
     from google.genai import types
 
+    # 9:16 + 720p: reel feed crop, faster Veo, smaller download/upload.
     video_kwargs = {
         "model": video_model,
         "prompt": veo_prompt,
         "config": types.GenerateVideosConfig(
-            aspect_ratio="16:9",
+            aspect_ratio="9:16",
             number_of_videos=1,
             duration_seconds=SEGMENT_LEN,
-            resolution="1080p",
+            resolution="720p",
             # Photorealistic people trigger celebrity/person RAI filters
             # (support code 15236754) on many Vertex projects.
             person_generation="dont_allow",
@@ -667,6 +668,7 @@ def _run_video_job(
             progress="Done",
             video_url=video_url,
             s3_key=s3_key,
+            filename=filename,
             user_id=user_id,
         )
     except Exception as exc:
@@ -692,6 +694,7 @@ class VideoStatusResponse(BaseModel):
     progress: Optional[str] = None
     video_url: Optional[str] = None
     s3_key: Optional[str] = None
+    filename: Optional[str] = None
     user_id: Optional[str] = None
     error: Optional[str] = None
 
@@ -701,7 +704,7 @@ async def api_generate_video(
     ad_text: str = Form(...),
     user_id: str = Form(...),
     language: str = Form("Marathi"),
-    duration_seconds: int = Form(30),
+    duration_seconds: int = Form(8),
     camera_motion: str = Form("Zoom (In)"),
     starting_image_type: str = Form("Scene"),
     starting_image: Optional[UploadFile] = File(None),
@@ -711,12 +714,12 @@ async def api_generate_video(
     On completion, stores under users/{user_id}/generated/videos/ on S3.
 
     multipart/form-data fields:
-      - starting_image (optional): first-frame image (Scene/Logo/Character/Product)
-      - starting_image_type: Scene | Logo | Character | Product (default Scene)
+      - starting_image (optional): first-frame image (Scene/Logo/Product)
+      - starting_image_type: Scene | Logo | Product (default Scene)
       - ad_text (required): raw ad copy to turn into a voiceover script
       - user_id (required): logged-in AdvPost user id
       - language: one of English, Hindi, Marathi (default Marathi)
-      - duration_seconds: one of 8, 16, 30 (default 30)
+      - duration_seconds: one of 8, 16, 30 (default 8)
       - camera_motion: e.g. "Zoom (In)", "Pan (left)", "Static Shot (or fixed)", etc.
 
     Returns a job_id. Poll GET /api/video/status/{job_id} until status is
@@ -727,10 +730,13 @@ async def api_generate_video(
     if duration_seconds not in _ALLOWED_DURATIONS:
         raise HTTPException(400, f"duration_seconds must be one of {sorted(_ALLOWED_DURATIONS)}")
 
-    allowed_types = {"Scene", "Logo", "Character", "Product"}
+    # Character encourages people shots that Veo RAI blocks (person_generation=dont_allow).
+    allowed_types = {"Scene", "Logo", "Product", "Character"}
     image_type = (starting_image_type or "Scene").strip()
     if image_type not in allowed_types:
         raise HTTPException(400, f"starting_image_type must be one of {sorted(allowed_types)}")
+    if image_type == "Character":
+        image_type = "Product"
 
     try:
         uid = normalize_user_id(user_id)
@@ -779,12 +785,18 @@ async def api_video_status(job_id: str):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(404, "job_id not found")
+    filename = job.get("filename")
+    if not filename and job.get("video_url"):
+        # Fallback so local /files rewrite works even for older jobs.
+        filename = f"{job_id}.mp4"
+
     return VideoStatusResponse(
         job_id=job["job_id"],
         status=job.get("status", "queued"),
         progress=job.get("progress"),
         video_url=job.get("video_url"),
         s3_key=job.get("s3_key"),
+        filename=filename,
         user_id=job.get("user_id"),
         error=job.get("error"),
     )

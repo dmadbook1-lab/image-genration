@@ -155,17 +155,30 @@ def store_generated_media(
     """
     Upload generated media under the user's S3 folder.
     Returns (public_url, s3_key).
+
+    When MEDIA_PUBLIC_BASE_URL is set (local/dev), keep the file on disk and
+    return that base + /files/{filename} so Android emulators can load media
+    without needing public DNS to reach S3.
     """
+    public_base = (os.environ.get("MEDIA_PUBLIC_BASE_URL") or "").rstrip("/")
+    keep_local_raw = (os.environ.get("KEEP_LOCAL_MEDIA") or "").strip().lower()
+    keep_local = keep_local_raw in {"1", "true", "yes", "on"} or bool(public_base)
+    safe_name = safe_filename(filename)
+
     if s3_required() or s3_enabled():
         require_s3()
         key = user_generated_key(user_id, media_kind, filename)
-        url = upload_file_to_s3(local_path, key, content_type)
-        if delete_local:
+        s3_url = upload_file_to_s3(local_path, key, content_type)
+        if delete_local and not keep_local:
             try:
                 os.remove(local_path)
             except OSError:
                 pass
-        return url, key
+        if public_base:
+            return f"{public_base}/files/{safe_name}", key
+        return s3_url, key
 
     # Local-only fallback when S3_REQUIRED=0 and AWS not configured
-    return f"/files/{safe_filename(filename)}", ""
+    if public_base:
+        return f"{public_base}/files/{safe_name}", ""
+    return f"/files/{safe_name}", ""

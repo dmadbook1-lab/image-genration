@@ -31,6 +31,9 @@ os.makedirs(GENERATED_DIR, exist_ok=True)
 _ALLOWED_IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}
 _ALLOWED_QUALITY = {"low", "medium", "high", "auto"}
 _MAX_LANGUAGE_LEN = 64
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB per input image
+_MAX_REF_EDGE = 1280  # downscale refs before OpenAI for faster edits
+_ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 router = APIRouter(prefix="/api/image", tags=["image"])
 logger = logging.getLogger(__name__)
@@ -56,49 +59,124 @@ def _get_openai_client():
             raise RuntimeError(
                 "Server misconfigured: OPENAI_API_KEY environment variable is not set."
             )
-        # Image generation can take 30–120s; keep a long read timeout.
-        _openai_client = OpenAI(api_key=api_key, timeout=180.0, max_retries=2)
+        # Image generation can take 15–90s; one retry only to avoid long stalls.
+        _openai_client = OpenAI(api_key=api_key, timeout=120.0, max_retries=1)
         return _openai_client
+
+
+def _detect_image_ext(content: bytes) -> Optional[str]:
+    """Return canonical extension from magic bytes, or None if unsupported."""
+    if len(content) < 12:
+        return None
+    if content[0:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if content[0:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if content[0:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _optimize_reference_image(path: str) -> str:
+    """
+    Downscale/recompress reference images before OpenAI edit.
+    Keeps visual fidelity while cutting upload+edit latency.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return path
+
+    try:
+        with Image.open(path) as img:
+            img = img.convert("RGBA") if img.mode in {"P", "LA"} else img
+            w, h = img.size
+            longest = max(w, h)
+            if longest > _MAX_REF_EDGE:
+                scale = _MAX_REF_EDGE / float(longest)
+                img = img.resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+
+            out_path = f"{os.path.splitext(path)[0]}_opt.jpg"
+            rgb = img.convert("RGB") if img.mode != "RGB" else img
+            rgb.save(out_path, format="JPEG", quality=82, optimize=True)
+            if out_path != path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return out_path
+    except Exception:
+        logger.exception("Failed to optimize reference image %s", path)
+        return path
 
 
 async def _optional_reference_bytes(upload: Optional[UploadFile]) -> Optional[tuple[bytes, str]]:
     """
     Returns (bytes, suffix) for a real image upload, else None.
 
-    Treats Swagger/docs empty sends as missing:
-      - no field
-      - empty filename
-      - zero-byte body
-      - filename placeholders like "string"
+    Enforces:
+      - JPG / PNG / WebP only (magic-byte check)
+      - max 5 MB
+      - skips Swagger/docs empty placeholders
     """
     if upload is None:
         return None
 
     name = (upload.filename or "").strip()
     if not name or name.lower() in {"string", "null", "undefined", "blob"}:
-        # Still allow a real blob upload with no filename if body has bytes
-        content = await upload.read()
+        content = await upload.read(_MAX_UPLOAD_BYTES + 1)
         if not content:
             return None
-        content_type = (upload.content_type or "").lower()
-        if content_type.startswith("image/"):
-            ext = ".png" if "png" in content_type else ".jpg"
-            return content, ext
-        return None
+        if len(content) > _MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                400,
+                f"Image exceeds max size of {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+            )
+        ext = _detect_image_ext(content)
+        if not ext:
+            content_type = (upload.content_type or "").lower()
+            if content_type.startswith("image/"):
+                raise HTTPException(
+                    400,
+                    "Unsupported image type. Use JPG, PNG, or WebP only.",
+                )
+            return None
+        return content, ext
 
-    content = await upload.read()
+    # Named upload — still validate magic bytes (extension alone is not trusted).
+    declared_ext = os.path.splitext(name)[1].lower()
+    if declared_ext and declared_ext not in _ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(
+            400,
+            f"Unsupported image extension '{declared_ext}'. Use JPG, PNG, or WebP.",
+        )
+
+    content = await upload.read(_MAX_UPLOAD_BYTES + 1)
     if not content:
         return None
+    if len(content) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            400,
+            f"Image '{name}' exceeds max size of {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
 
-    suffix = os.path.splitext(name)[1] or ".png"
-    return content, suffix
+    ext = _detect_image_ext(content)
+    if not ext:
+        raise HTTPException(
+            400,
+            f"File '{name}' is not a valid JPG, PNG, or WebP image.",
+        )
+    return content, ext
 
 
 def generate_image(
     prompt: str,
     reference_image_paths: Optional[list] = None,
-    size: str = "1536x1024",
-    quality: str = "medium",
+    size: str = "1024x1024",
+    quality: str = "low",
     output_path: str = "output.png",
 ) -> str:
     """Calls GPT Image 2 and writes the resulting PNG to output_path."""
@@ -108,6 +186,8 @@ def generate_image(
         p for p in (reference_image_paths or [])
         if p and os.path.isfile(p) and os.path.getsize(p) > 0
     ]
+    # Downscale large client uploads so images.edit stays fast.
+    valid_refs = [_optimize_reference_image(p) for p in valid_refs]
 
     if valid_refs:
         image_files = [open(p, "rb") for p in valid_refs]
@@ -354,8 +434,8 @@ def _reference_assets_prompt_block(
 async def api_generate_image(
     prompt: str = Form(..., description="Image prompt (required)"),
     user_id: str = Form(..., description="Logged-in AdvPost user id"),
-    size: str = Form("1536x1024"),
-    quality: str = Form("medium"),
+    size: str = Form("1024x1024"),
+    quality: str = Form("low"),
     language: str = Form(
         "Marathi",
         description=(
@@ -369,32 +449,45 @@ async def api_generate_image(
     ),
     logo_image: Annotated[
         _OptionalUpload,
-        File(description="Optional business logo (placed as brand mark, never redrawn)."),
+        File(
+            description=(
+                "Optional business logo (JPG/PNG/WebP, max 5 MB). "
+                "Placed as brand mark, never redrawn."
+            ),
+        ),
     ] = None,
     product_images: Annotated[
         _ProductUploadList,
-        File(description="Optional product photos (up to 4) used as hero visuals."),
+        File(
+            description=(
+                "Optional product photos (up to 4, JPG/PNG/WebP, max 5 MB each) "
+                "used as hero visuals."
+            ),
+        ),
     ] = [],
     reference_image: Annotated[
         _OptionalUpload,
-        File(description="Optional generic reference image (legacy field)."),
+        File(
+            description=(
+                "Optional generic reference image (JPG/PNG/WebP, max 5 MB)."
+            ),
+        ),
     ] = None,
 ):
     """
     Starts an async image generation job on a worker thread.
 
-    GPT Image can take 30–120s, which exceeds Cloudflare's proxy timeout when
-    done synchronously. Returns a job_id immediately — poll
-    GET /api/image/status/{job_id} until status is completed or failed.
+    GPT Image can take 15–90s depending on quality/size. Returns a job_id
+    immediately — poll GET /api/image/status/{job_id} until completed/failed.
 
     multipart/form-data fields:
       - prompt (required)
       - user_id (required): logged-in AdvPost user id
-      - size: one of 1024x1024, 1536x1024, 1024x1536, auto (default 1536x1024)
-      - quality: one of low, medium, high, auto (default medium)
+      - size: one of 1024x1024, 1536x1024, 1024x1536, auto (default 1024x1024)
+      - quality: one of low, medium, high, auto (default low — fastest)
       - language: any language name for on-image text (default Marathi)
       - color_palette: OPTIONAL comma-separated hex colors for the poster
-      - logo_image: OPTIONAL business logo file
+      - logo_image: OPTIONAL business logo file (JPG/PNG/WebP ≤ 5 MB)
       - product_images: OPTIONAL product photos (repeat field, up to 4)
       - reference_image: OPTIONAL legacy generic reference image
     """
