@@ -1,6 +1,20 @@
 """
 Video generation module — Veo 3.1 + Gemini (Google Vertex AI).
 
+Plan-first architecture:
+  1. Gemini writes a structured JSON ad plan (scenes, camera moves, voiceover,
+     hashtags, on-screen text) based on business details.
+  2. A full voiceover script is generated, then deterministically split into
+     one line per scene so each scene's Veo prompt asks Veo to speak its own
+     slice aloud (generate_audio=True).
+  3. Each scene gets its own focused, category-aware Veo prompt with safety
+     rules and per-category "suggested movement" library.
+  4. Scenes are generated in parallel (fast_mode) or sequentially
+     (frame-chained for pixel continuity).
+  5. Clips are concatenated, trimmed to target length, and human-readable
+     on-screen text (business name / offer / CTA / phone) is overlaid by
+     ffmpeg drawtext — never baked into the AI video.
+
 Exposes:
   - router    FastAPI router with:
                 POST /api/video/generate
@@ -16,8 +30,11 @@ Optional environment variables:
 Also requires the `ffmpeg` binary on the host.
 """
 
+import concurrent.futures
+import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -41,9 +58,18 @@ _DEFAULT_SA_JSON = _MODULE_DIR / "video-generation-veo-502109-7f1a9e95d0c7.json"
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_LEN = 8  # Veo 3.1 only accepts 4, 6, or 8 seconds per single call
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+VEO_ALLOWED_SEGMENT_SECONDS = (4, 6, 8)  # only these are accepted per Veo call
 _LANGUAGE_CODES = {"English": "en", "Hindi": "hi", "Marathi": "mr"}
-_ALLOWED_DURATIONS = {8, 16, 30}
+_ALLOWED_DURATIONS = {8, 16, 24, 30, 32, 40, 48}
+
+VIDEO_MODEL = "veo-3.1-fast-generate-001"
+GEMINI_MODEL = "gemini-3.5-flash"
+
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 10
 
 router = APIRouter(prefix="/api/video", tags=["video"])
 
@@ -54,7 +80,123 @@ _vertex_credentials = None
 _vertex_credentials_path: Optional[str] = None
 _vertex_credentials_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Camera motion options
+# ---------------------------------------------------------------------------
+_CAMERA_MOTION_OPTIONS = [
+    "None", "Eye-Level Shot", "Low-Angle Shot", "High-Angle Shot", "Zoom (In)",
+    "Zoom (Out)", "Dolly (In)", "Dolly (Out)", "Pan (left)", "Pan (right)",
+    "Crane Shot", "Aerial Shot", "Static Shot (or fixed)",
+]
 
+_LANGUAGE_CTA = {
+    "English": "Call Now",
+    "Hindi": "Abhi Call Karein",
+    "Marathi": "Aatach Call Kara",
+}
+
+# ---------------------------------------------------------------------------
+# Safety & motion rule templates
+# ---------------------------------------------------------------------------
+_SAFETY_RULES = """
+CRITICAL SAFETY RULES (must follow):
+- Do NOT depict any real, named, or identifiable public figure, celebrity, or
+  politician, and do not invent a celebrity look-alike.
+- People shown must be generic, non-identifiable models/actors appropriate to
+  the scene (e.g. "a stylist", "a customer", "a farmer") — never a specific
+  real person.
+- Keep everything family-friendly: no violence, weapons, sexual content,
+  alcohol/drug abuse, hate, or political content.
+- No children shown without a supervising adult also in frame.
+""".strip()
+
+_MOTION_RULES_TEMPLATE = """
+VIDEO DIRECTION (VERY IMPORTANT)
+
+This video must feel like a professionally directed commercial.
+Never create a static or frozen scene.
+The scene must remain visually alive from the first frame to the last frame.
+
+Camera Direction:
+{camera_motion_desc}
+
+Scene Direction:
+- Every scene must contain continuous natural movement.
+- The subject should actively perform meaningful actions related to the business.
+- Background elements should also have subtle natural motion.
+- The camera movement should feel cinematic and intentional.
+- Every 2-3 seconds something new should happen.
+
+Suggested movement for this business type:
+{business_movement_examples}
+
+Motion Rules:
+- Never hold the exact same composition for more than 2 seconds.
+- Add natural body movement, realistic facial expressions, environmental
+  movement, and smooth camera transitions.
+- Keep movement realistic and physically accurate; avoid repetitive or
+  looping animations. Never freeze the background or the subject.
+
+Audio rule:
+- This scene must include a spoken voiceover line, delivered in a natural,
+  energetic announcer voice, in addition to ambient/background sound. See
+  the "Voiceover for this scene" section below for exactly what to say.
+
+Do NOT generate a slideshow, a talking image, or a static product shot.
+Every second should feel like a real advertisement shot by a professional
+film crew.
+""".strip()
+
+# ---------------------------------------------------------------------------
+# Per-category movement library
+# ---------------------------------------------------------------------------
+BUSINESS_MOTION_LIBRARY = {
+    "salon": ["Customer entering salon", "Reception greeting", "Hair wash",
+              "Hair cutting", "Hair styling", "Happy customer smiling"],
+    "beauty wellness": ["Customer relaxing during treatment", "Therapist applying product",
+                         "Product being poured/applied", "Client smiling in mirror"],
+    "restaurant cafe": ["Chef cooking", "Food plating", "Steam rising", "Serving food",
+                         "Family enjoying meal"],
+    "food beverage": ["Ingredients being prepared", "Product being poured/packaged",
+                       "Steam or condensation", "Customer tasting/enjoying product"],
+    "agriculture": ["Farmer inspecting crops", "Spraying fertilizer", "Drone monitoring field",
+                     "Healthy crop close-up", "Harvest scene"],
+    "health fitness": ["Trainer demonstrating exercise", "Client working out",
+                        "Equipment in motion", "Sweat/effort close-up", "High-five after workout"],
+    "medical": ["Doctor consulting patient", "Medicine handover", "Reception assistance",
+                "Pharmacist arranging medicines"],
+    "stores services": ["Customer shopping", "Product pickup", "Cash counter billing",
+                         "Shopping bags moving", "Staff assisting customer"],
+    "products": ["Product being unboxed", "Close-up product rotation",
+                 "Hands demonstrating use", "Packaging being sealed/labelled"],
+    "construction real estate": ["Workers on site", "Crane or machinery moving",
+                                  "Walkthrough of finished space", "Blueprint review",
+                                  "Handover handshake"],
+    "home living": ["Furniture being arranged", "Hands adjusting decor",
+                     "Natural light shifting in room", "Family using the space"],
+    "fashion apparel": ["Model walking or turning", "Fabric moving naturally",
+                         "Customer trying on outfit", "Rack of clothes being browsed"],
+    "jewellery": ["Jewellery catching light as it turns", "Hands placing piece on display",
+                  "Customer trying on piece", "Close-up sparkle/reflection detail"],
+    "travel hospitality": ["Guest arriving and being welcomed", "Luggage being carried",
+                            "Scenic view reveal", "Guests relaxing at property"],
+    "events entertainment": ["Venue being set up", "Guests arriving and mingling",
+                              "Performance/activity in motion", "Candid crowd reactions"],
+    "apps": ["Hands using phone with UI on screen", "Notification/animation on screen",
+              "Person reacting positively to app result"],
+}
+
+_GENERIC_MOVEMENT_EXAMPLES = [
+    "Staff actively working with the product/service",
+    "Customer interacting naturally with the business",
+    "Hands demonstrating or handling the product",
+    "Environmental motion (light, steam, fabric, or foot traffic) in the background",
+]
+
+
+# =========================================================================
+# Service-account / Vertex client infrastructure (preserved from original)
+# =========================================================================
 def _service_account_json_path() -> Path:
     override = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if override:
@@ -146,16 +288,9 @@ def ffmpeg_available() -> bool:
     return which("ffmpeg") is not None
 
 
-def extract_last_frame(video_path, frame_path):
-    _run_ffmpeg(
-        [
-            "ffmpeg", "-y", "-sseof", "-1", "-i", video_path,
-            "-update", "1", "-q:v", "1", frame_path,
-        ],
-        label="extract last frame",
-    )
-
-
+# =========================================================================
+# ffmpeg helpers (preserved from original, with burn-in addition)
+# =========================================================================
 def _run_ffmpeg(cmd: list[str], *, label: str) -> None:
     """Run ffmpeg and raise a readable error with stderr on failure."""
     try:
@@ -181,6 +316,16 @@ def _run_ffmpeg(cmd: list[str], *, label: str) -> None:
     tail = stderr[-800:] if stderr else "(no ffmpeg stderr)"
     raise RuntimeError(
         f"ffmpeg {label} failed (exit {result.returncode}).{disk_hint}\n{tail}"
+    )
+
+
+def extract_last_frame(video_path, frame_path):
+    _run_ffmpeg(
+        [
+            "ffmpeg", "-y", "-sseof", "-1", "-i", video_path,
+            "-update", "1", "-q:v", "1", frame_path,
+        ],
+        label="extract last frame",
     )
 
 
@@ -303,155 +448,251 @@ def _download_video_bytes(video) -> bytes:
     return response.content
 
 
-_SAFETY_RULES = """
-CRITICAL SAFETY / RAI RULES (must follow — Veo blocks photorealistic people):
-- Do NOT depict any human faces, celebrities, public figures, children, or
-  photorealistic people of any kind.
-- Prefer: products, packaging, storefronts, interiors, food, logos as graphics,
-  text overlays, hands-only close-ups (no face), city/street atmosphere without
-  identifiable faces, abstract motion graphics.
-- Never name or describe a real person. Never invent celebrity look-alikes.
-- Keep the ad family-friendly: no violence, weapons, sexual content, alcohol
-  abuse, drugs, hate, or political content.
-- Voiceover may be an off-screen announcer — do not show the speaker on camera.
-""".strip()
-
-_MOTION_RULES_TEMPLATE = """
-MOTION REQUIREMENTS (critical — the previous videos were coming out too static):
-- The video must show continuous, visible motion for the FULL 8 seconds, not one
-  frozen composition with a voiceover played over it.
-- Camera motion for this segment: {camera_motion}. If this is "Static Shot" or
-  "fixed", treat it as meaning the camera rig doesn't move — it does NOT mean the
-  scene is frozen. You must still animate the scene itself.
-- In addition to (or instead of) camera movement, describe specific in-scene
-  motion appropriate to the brief: product rotating or being picked up/opened,
-  liquid pouring, steam rising, packaging unboxing, fabric or hair-free motion
-  graphics, light/reflections shifting, particles or dust in the air, screens or
-  UI elements animating, text overlays sliding/fading in, vehicles or machinery
-  moving, storefront signage lighting up, etc. Pick 1-2 that fit the business.
-- Include at least one visible change over the 8 seconds — a shift in framing,
-  distance, subject focus, or a clear beat/transition (e.g. "opens on a wide
-  shot of the storefront, then pushes in as the product is revealed on the
-  counter") — never one static, held, or frozen composition throughout.
-- Do not use the words "static," "frozen," "still," or "held" to describe the
-  overall shot — only ever to describe camera rig stability, if at all.
-""".strip()
+# =========================================================================
+# Prompt-building helpers
+# =========================================================================
+def _get(business, key, default=""):
+    value = business.get(key, default)
+    return value if value not in (None, "") else default
 
 
-def build_prompt(
-    language_name,
-    ad_text,
-    segment_index,
-    covered_context,
-    camera_motion,
-    starting_image_type="Scene",
-    has_starting_image=False,
-    is_final_segment=True,
-    safe_mode=False,
-):
-    if has_starting_image:
-        type_label = (starting_image_type or "Scene").strip() or "Scene"
-        assets_block = (
-            f"- The attached image is a {type_label.lower()} — treat it as the "
-            "visual anchor for the first frame / continuity. If it contains a "
-            "person or face, reinterpret it as a logo/product graphic only and "
-            "do not animate a photorealistic person."
-        )
-    else:
-        assets_block = (
-            "- No reference image was provided — invent a cinematic promotional "
-            "scene with products, storefront, packaging, or motion graphics "
-            "(NO people / NO faces)."
-        )
+def _normalize_category(category):
+    return re.sub(r"\s+", " ", re.sub(r"[&,]| and ", " ", category.lower())).strip()
 
-    brief_rules = """
-The advertisement brief below may be a structured brief with labeled sections
-(BUSINESS DETAILS, AD MESSAGE, VISUAL STYLE, CONTACT DETAILS) or plain ad text.
-Honor every section that is present:
-- BUSINESS DETAILS: mention the business name in the voiceover; let the category,
-  purpose, and target audience shape the scene, tone, and wording.
-- AD MESSAGE: this is the core of the voiceover script. If it asks you to write
-  the script yourself, write a compelling one from the business details.
-- VISUAL STYLE: follow this style/mood with products and environments only
-  (never add people to make a style feel "friendly").
-- CONTACT DETAILS: work them into the closing call-to-action (spoken naturally)
-  and describe clean on-screen text overlays showing them near the end of the
-  video. Reproduce phone numbers, websites, and addresses EXACTLY as written —
-  never invent or alter contact information.""".strip()
 
-    safe_extra = ""
-    if safe_mode:
-        safe_extra = (
-            "\nSAFE RETRY MODE: Previous attempt was blocked by Vertex AI safety "
-            "filters. Rewrite as a purely product / storefront / text-overlay "
-            "commercial with ZERO humans, faces, or celebrity likenesses.\n"
-        )
+def _business_movement_examples(category):
+    norm = _normalize_category(category or "")
+    for key, examples in BUSINESS_MOTION_LIBRARY.items():
+        if key in norm or norm in key:
+            return "\n".join(f"- {e}" for e in examples)
+    return "\n".join(f"- {e}" for e in _GENERIC_MOVEMENT_EXAMPLES)
 
-    # FIX: this must be computed unconditionally (not inside `if is_final_segment`)
-    # since it's referenced by every return branch below, for every segment.
-    motion_rules = _MOTION_RULES_TEMPLATE.format(camera_motion=camera_motion)
 
-    final_rule = ""
-    if is_final_segment:
-        final_rule = (
-            "- This is the FINAL segment: end with a strong call-to-action, and "
-            "if the brief has CONTACT DETAILS, speak them naturally and show "
-            "them as clean on-screen text.\n"
-        )
+def _motion_rules(camera_motion, category):
+    camera_motion_desc = (
+        camera_motion if camera_motion and camera_motion != "None"
+        else "No specific camera movement requested — choose whatever camera "
+        "move best serves the scene, but the camera rig moving or not moving "
+        "does NOT excuse the scene content itself from being in motion."
+    )
+    return _MOTION_RULES_TEMPLATE.format(
+        camera_motion_desc=camera_motion_desc,
+        business_movement_examples=_business_movement_examples(category),
+    )
 
-    if segment_index == 0:
-        return f"""
-You are an expert prompt engineer for Google's Veo video model, and a scriptwriter
-for short promotional / recruitment advertisement videos.
 
-Turn the advertisement brief below into ONE cohesive 8-second cinematic Veo prompt.
+# =========================================================================
+# Step 1: structured ad plan prompt
+# =========================================================================
+def build_video_plan_prompt(business):
+    """Ask Gemini for the full structured ad plan. Output: JSON only."""
+    name = _get(business, "name", "the business")
+    category = _get(business, "category", "General")
+    duration = int(_get(business, "duration", 30) or 30)
+    allowed_str = ", ".join(str(s) for s in VEO_ALLOWED_SEGMENT_SECONDS)
+    camera_options_str = ", ".join(_CAMERA_MOTION_OPTIONS)
 
-{_SAFETY_RULES}
-{safe_extra}
-{brief_rules}
-
-Image asset guidance:
-{assets_block}
-
-Requirements:
-- The spoken voiceover/dialogue in the video must be written in {language_name},
-  and should summarize the key hook of the ad (company/brand name, offer or hiring
-  message, and urgency) in a natural, energetic announcer voice (off-screen).
-{motion_rules}
-- Describe visual style, setting, and mood clearly — products and places only.
-{final_rule}- Output ONLY the final Veo prompt text (including the {language_name} spoken line
-  in quotes), no preamble, no markdown.
-
-Advertisement brief:
-\"\"\"{ad_text}\"\"\"
-"""
     return f"""
-You are continuing an 8-second Veo video segment (segment #{segment_index + 1}) of a
-promotional / recruitment advertisement. The previous segment ended on the attached frame.
+You are an expert creative director and marketing strategist for small businesses.
+Your job is NOT to generate a video. Your job is to create a complete ad video
+plan for AI video production.
 
-Write the next 8-second Veo prompt that continues smoothly from that frame.
+Business details:
+- Business name: {name}
+- Category: {category}
+- Product/service: {_get(business, "product")}
+- Description: {_get(business, "description")}
+- Target audience: {_get(business, "audience", "general local customers")}
+- Language: {_get(business, "language", "English")}
+- Offer: {_get(business, "offer")}
+- Location: {_get(business, "location")}
+- Platform: {_get(business, "platform", "Instagram Reels")}
+- Duration: {duration} seconds
+
+Create a strong advertising plan that suits this business type.
+
+Scene duration rules (CRITICAL):
+- Each individual scene's "duration_seconds" MUST be exactly one of: {allowed_str}.
+- The scenes' durations MUST sum to exactly {duration} seconds.
+- Each scene's "camera_motion" MUST be exactly one of: {camera_options_str}.
+
+Output rules (CRITICAL):
+- Return ONLY valid JSON. No markdown, no code fences, no preamble — the
+  response must start with {{ and end with }}.
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "campaign_goal": "", "target_customer": "", "ad_style": "",
+  "primary_emotion": "", "voice_style": "", "music_style": "",
+  "color_tone": "", "cta": "", "voiceover": "",
+  "scenes": [
+    {{"scene_number": 1, "purpose": "", "visual_description": "",
+      "camera_motion": "", "duration_seconds": 0, "on_screen_text": ""}}
+  ],
+  "hashtags": []
+}}
+"""
+
+
+def parse_plan_json(raw_text):
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    plan = json.loads(cleaned)
+    _validate_plan(plan)
+    return plan
+
+
+def _validate_plan(plan):
+    scenes = plan.get("scenes") or []
+    if not scenes:
+        raise ValueError("Plan JSON has no scenes.")
+    for scene in scenes:
+        dur = scene.get("duration_seconds")
+        if dur not in VEO_ALLOWED_SEGMENT_SECONDS:
+            nearest = min(VEO_ALLOWED_SEGMENT_SECONDS, key=lambda s: abs(s - (dur or 8)))
+            scene["duration_seconds"] = nearest
+        if scene.get("camera_motion") not in _CAMERA_MOTION_OPTIONS:
+            scene["camera_motion"] = "None"
+
+
+# =========================================================================
+# Voiceover splitting
+# =========================================================================
+def _split_voiceover_script(voiceover_script, n_scenes):
+    """Deterministically divide the full VO script into n_scenes chunks by
+    sentence, so every scene's line is decided up front — no scene has to
+    wait to see what an earlier scene said, which is what lets scenes be
+    generated in parallel instead of one-at-a-time."""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", (voiceover_script or "").strip()) if s.strip()]
+    if not sentences:
+        return [""] * n_scenes
+    if len(sentences) <= n_scenes:
+        return sentences + [""] * (n_scenes - len(sentences))
+    base, extra = divmod(len(sentences), n_scenes)
+    chunks, idx = [], 0
+    for i in range(n_scenes):
+        size = base + (1 if i < extra else 0)
+        chunks.append(" ".join(sentences[idx:idx + size]))
+        idx += size
+    return chunks
+
+
+# =========================================================================
+# Step 2: per-scene Veo prompt
+# =========================================================================
+def build_scene_prompt(business, scene, previous_scene_summary="", voiceover_line=""):
+    """One focused Veo prompt per scene. voiceover_line is this scene's
+    pre-assigned slice of the overall VO script (see _split_voiceover_script)
+    — deciding it up front instead of asking Gemini to infer "what hasn't been
+    said yet" is what lets scenes be built independently / in parallel."""
+    motion_rules = _motion_rules(scene.get("camera_motion"), _get(business, "category", "General"))
+    language = _get(business, "language", "English")
+    voiceover_instruction = (
+        f'- Voiceover: have the scene\'s spoken audio deliver, in {language}, '
+        f'in a natural energetic announcer voice: "{voiceover_line}"'
+        if voiceover_line else
+        f"- Voiceover: no line is assigned to this scene — include only "
+        f"natural ambient/background sound, no spoken words."
+    )
+    return f"""
+Generate ONLY one cinematic video scene for a short business advertisement.
 
 {_SAFETY_RULES}
-{safe_extra}
-{brief_rules}
 
-Image asset guidance (keep continuity):
-{assets_block}
+Business:
+- Name: {_get(business, "name", "the business")}
+- Category: {_get(business, "category", "General")}
+- Product/service: {_get(business, "product")}
+- Language: {language}
+- Location: {_get(business, "location")}
 
-Requirements:
-- Continue the voiceover in {language_name}, covering the NEXT chunk of the ad
-  content below that hasn't been spoken yet, staying energetic and clear.
-{final_rule}{motion_rules}
-- Keep visual style/setting consistent across segments. Still NO people or faces.
-- Output ONLY the final Veo prompt text (including the {language_name} spoken line
-  in quotes), no preamble, no markdown.
+Scene details:
+- Scene number: {scene.get("scene_number")}
+- Purpose: {scene.get("purpose")}
+- Visual description: {scene.get("visual_description")}
+- Camera motion: {scene.get("camera_motion")}
+- Duration: {scene.get("duration_seconds")} seconds
 
-Full advertisement brief for reference (avoid repeating lines already used):
-\"\"\"{ad_text}\"\"\"
+Previous scene(s) so far, for style/continuity reference only:
+{previous_scene_summary or "(this is the first scene)"}
 
-Content already covered so far:
-{covered_context}
+{voiceover_instruction}
+
+{motion_rules}
+
+Rules:
+- Generate only this scene.
+- Keep it natural, cinematic, and suitable for the business category.
+- Do not generate any on-screen text, subtitles, captions, phone numbers,
+  prices, or logos inside the video.
+- Keep the scene visually distinct from earlier ones, but consistent in
+  setting/style.
+- Output only the final video prompt text (including the quoted spoken line,
+  if one was assigned) — no preamble, no markdown.
 """
+
+
+# =========================================================================
+# Step 3: voiceover script prompt
+# =========================================================================
+def build_voiceover_prompt(business, voiceover_text):
+    """A clean voiceover script, meant for a separate TTS/dub pass."""
+    return f"""
+You are a professional ad script writer for small business marketing videos.
+
+Write a natural voiceover script in {_get(business, "language", "English")} for
+this business:
+
+Business name: {_get(business, "name")}
+Category: {_get(business, "category")}
+Product/service: {_get(business, "product")}
+Offer: {_get(business, "offer")}
+Audience: {_get(business, "audience", "general local customers")}
+
+Rules:
+- Keep it short, strong, and easy to understand.
+- Make it sound like a real advertisement, not AI-generated wording.
+- Do not invent contact details, prices, or offers not already given below.
+
+Voiceover text:
+{voiceover_text}
+
+Return only the final script.
+"""
+
+
+# =========================================================================
+# Step 4: overlay text builder
+# =========================================================================
+def build_overlay_text(business):
+    """Readable text the app overlays after generation via ffmpeg drawtext."""
+    lang = _get(business, "language", "English")
+    return {
+        "business_name": _get(business, "name"),
+        "offer_text": _get(business, "offer"),
+        "cta_text": _LANGUAGE_CTA.get(lang, _LANGUAGE_CTA["English"]),
+        "phone": _get(business, "phone"),
+        "website": _get(business, "website"),
+        "address": _get(business, "address"),
+    }
+
+
+# =========================================================================
+# Execution engine — retry wrapper, Gemini calls, Veo calls
+# =========================================================================
+def _with_retries(fn, what):
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - want to retry on anything transient
+            last_err = e
+            logger.warning("%s failed (attempt %d/%d): %s", what, attempt, MAX_RETRIES, e)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise RuntimeError(f"{what} failed after {MAX_RETRIES} attempts") from last_err
+
 
 def _image_part(path: str):
     from google.genai import types
@@ -462,111 +703,190 @@ def _image_part(path: str):
     return types.Part.from_bytes(data=image_bytes, mime_type=mime)
 
 
+def call_gemini_text(gemini_client, prompt_text, image_path=None):
+    """Call Gemini for text generation with retries."""
+    contents = [prompt_text]
+    if image_path and os.path.exists(image_path):
+        contents.append(_image_part(image_path))
+
+    def _call():
+        resp = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        text = (resp.text or "").strip()
+        if not text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return text
+
+    return _with_retries(_call, "Gemini text generation")
+
+
+def call_gemini_plan(gemini_client, business):
+    """Call Gemini for the structured ad plan with retries and validation."""
+    prompt = build_video_plan_prompt(business)
+
+    def _call():
+        raw = call_gemini_text(gemini_client, prompt)
+        return parse_plan_json(raw)
+
+    return _with_retries(_call, "Gemini plan generation")
+
+
 def _is_rai_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "rai" in msg or "usage guidelines" in msg or "filtered out" in msg
 
 
-def _gemini_veo_prompt(gemini_client, gemini_model, prompt_text, image_path=None) -> str:
-    contents = [prompt_text]
-    if image_path and os.path.exists(image_path):
-        contents.append(_image_part(image_path))
-
-    gem_response = gemini_client.models.generate_content(
-        model=gemini_model,
-        contents=contents,
-    )
-    veo_prompt = (gem_response.text or "").strip()
-    if not veo_prompt:
-        raise RuntimeError("Gemini returned an empty Veo prompt.")
-    return veo_prompt
-
-
-def _call_veo(client, video_model, veo_prompt, image_path=None):
+def generate_veo_clip(client, veo_prompt, image_path, duration_seconds, aspect_ratio="9:16"):
+    """Generate a single Veo clip with retries. Accepts per-scene duration
+    and aspect ratio. On RAI filter hit, auto-retries without image."""
     from google.genai import types
 
-    # 9:16 + 720p: reel feed crop, faster Veo, smaller download/upload.
-    video_kwargs = {
-        "model": video_model,
-        "prompt": veo_prompt,
-        "config": types.GenerateVideosConfig(
-            aspect_ratio="9:16",
-            number_of_videos=1,
-            duration_seconds=SEGMENT_LEN,
-            resolution="720p",
-            # Photorealistic people trigger celebrity/person RAI filters
-            # (support code 15236754) on many Vertex projects.
-            person_generation="dont_allow",
-            generate_audio=True,
-        ),
-    }
-    if image_path and os.path.exists(image_path):
-        video_kwargs["image"] = types.Image.from_file(location=image_path)
+    def _call():
+        video_kwargs = {
+            "model": VIDEO_MODEL,
+            "prompt": veo_prompt,
+            "config": types.GenerateVideosConfig(
+                aspect_ratio=aspect_ratio,
+                number_of_videos=1,
+                duration_seconds=duration_seconds,  # must be 4, 6, or 8
+                resolution="720p",
+                person_generation="allow_adult",
+                generate_audio=True,
+            ),
+        }
+        if image_path and os.path.exists(image_path):
+            video_kwargs["image"] = types.Image.from_file(location=image_path)
 
-    operation = client.models.generate_videos(**video_kwargs)
-    operation = _wait_for_video_operation(client, operation)
-    generated = _video_operation_payload(operation)
-    if generated.video is None:
-        raise RuntimeError("Generated video entry is missing video data.")
-    return _download_video_bytes(generated.video)
-
-
-def generate_segment(
-    client,
-    gemini_client,
-    gemini_model,
-    video_model,
-    image_path,
-    prompt_text,
-    *,
-    safe_retry_prompt_builder=None,
-):
-    """Generate one Veo segment. On RAI filter, auto-retry with a safer prompt
-    (and without the starting image if needed).
-    """
-    veo_prompt = _gemini_veo_prompt(
-        gemini_client, gemini_model, prompt_text, image_path=image_path
-    )
-    logger.info("Veo prompt (first attempt): %s", veo_prompt[:500])
+        operation = client.models.generate_videos(**video_kwargs)
+        operation = _wait_for_video_operation(client, operation)
+        generated = _video_operation_payload(operation)
+        if generated.video is None:
+            raise RuntimeError("Generated video entry is missing video data.")
+        return _download_video_bytes(generated.video)
 
     try:
-        video_bytes = _call_veo(client, video_model, veo_prompt, image_path=image_path)
-        return video_bytes, veo_prompt
+        return _with_retries(_call, "Veo video generation")
     except Exception as first_err:
         if not _is_rai_error(first_err):
             raise
-        logger.warning("Veo RAI filter hit; retrying with safer no-people prompt: %s", first_err)
+        logger.warning("Veo RAI filter hit; retrying without image: %s", first_err)
 
-    # Retry 1: safer Gemini rewrite, keep image
-    if safe_retry_prompt_builder is not None:
-        safe_prompt_text = safe_retry_prompt_builder()
-    else:
-        safe_prompt_text = (
-            prompt_text
-            + "\n\nSAFE RETRY: rewrite with ZERO humans/faces; products and "
-            "storefronts only."
-        )
-    veo_prompt = _gemini_veo_prompt(
-        gemini_client, gemini_model, safe_prompt_text, image_path=None
+    # Retry without the starting image (often the trigger for RAI blocks)
+    def _call_no_image():
+        video_kwargs = {
+            "model": VIDEO_MODEL,
+            "prompt": veo_prompt,
+            "config": types.GenerateVideosConfig(
+                aspect_ratio=aspect_ratio,
+                number_of_videos=1,
+                duration_seconds=duration_seconds,
+                resolution="720p",
+                person_generation="allow_adult",
+                generate_audio=True,
+            ),
+        }
+        operation = client.models.generate_videos(**video_kwargs)
+        operation = _wait_for_video_operation(client, operation)
+        generated = _video_operation_payload(operation)
+        if generated.video is None:
+            raise RuntimeError("Generated video entry is missing video data.")
+        return _download_video_bytes(generated.video)
+
+    return _with_retries(_call_no_image, "Veo video generation (RAI retry, no image)")
+
+
+# =========================================================================
+# Per-scene generation (safe for concurrent use)
+# =========================================================================
+def _generate_one_scene(index, scene, business, gemini_client, veo_client,
+                        ref_image, previous_summary, voiceover_line,
+                        aspect_ratio, work_dir):
+    """Build the prompt and generate the clip for a single scene. Safe to
+    run concurrently for several scenes at once since it only touches files
+    named for its own scene index."""
+    scene_prompt_instructions = build_scene_prompt(
+        business, scene, previous_summary, voiceover_line=voiceover_line
     )
-    logger.info("Veo prompt (safe retry): %s", veo_prompt[:500])
+    veo_prompt = call_gemini_text(gemini_client, scene_prompt_instructions, image_path=ref_image)
+    logger.info("Scene %d Veo prompt: %.500s", index + 1, veo_prompt)
 
-    try:
-        video_bytes = _call_veo(client, video_model, veo_prompt, image_path=None)
-        return video_bytes, veo_prompt
-    except Exception as second_err:
-        if not _is_rai_error(second_err):
-            raise
-        logger.warning("Veo RAI filter hit again on safe retry: %s", second_err)
-        raise RuntimeError(
-            "Video was blocked by Vertex AI safety filters (often for "
-            "photorealistic people / celebrity likeness). Try again with a "
-            "product or storefront image, avoid describing people, and keep "
-            "the ad message family-friendly."
-        ) from second_err
+    video_bytes = generate_veo_clip(
+        veo_client, veo_prompt, ref_image, scene["duration_seconds"], aspect_ratio
+    )
+    clip_path = os.path.join(work_dir, f"scene_{index + 1}.mp4")
+    with open(clip_path, "wb") as f:
+        f.write(video_bytes)
+    return index, clip_path, veo_prompt
 
 
+# =========================================================================
+# ffmpeg text burn-in
+# =========================================================================
+_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    # macOS
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/Library/Fonts/Arial.ttf",
+]
 
+
+def _find_font():
+    for path in _FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _ffmpeg_escape(text):
+    return (text or "").replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+
+
+def burn_in_overlay(in_path, out_path, overlay, total_seconds):
+    """Burn business name/CTA (first 3s) and offer/phone/website (last 3s)
+    onto the finished video as lower-third captions. Skips gracefully if no
+    usable font is found on the machine, since the video is still valid
+    without it."""
+    font = _find_font()
+    if not font:
+        logger.warning(
+            "No system font found for text overlay — skipping burn-in; "
+            "the plain video is still saved."
+        )
+        return in_path
+
+    filters = []
+    intro_text = " | ".join(t for t in [overlay["business_name"], overlay["cta_text"]] if t)
+    if intro_text:
+        filters.append(
+            f"drawtext=fontfile='{font}':text='{_ffmpeg_escape(intro_text)}':"
+            "fontcolor=white:fontsize=42:box=1:boxcolor=black@0.55:boxborderw=14:"
+            "x=(w-text_w)/2:y=h-h/6:enable='between(t,0,3)'"
+        )
+
+    outro_parts = [t for t in [overlay["offer_text"], overlay["phone"], overlay["website"]] if t]
+    outro_text = " | ".join(outro_parts)
+    if outro_text:
+        start = max(0, total_seconds - 3)
+        filters.append(
+            f"drawtext=fontfile='{font}':text='{_ffmpeg_escape(outro_text)}':"
+            "fontcolor=white:fontsize=36:box=1:boxcolor=black@0.55:boxborderw=14:"
+            f"x=(w-text_w)/2:y=h-h/6:enable='between(t,{start},{total_seconds})'"
+        )
+
+    if not filters:
+        return in_path
+
+    _run_ffmpeg(
+        ["ffmpeg", "-y", "-i", in_path, "-vf", ",".join(filters),
+         "-c:a", "copy", out_path],
+        label="burn-in overlay",
+    )
+    return out_path
+
+
+# =========================================================================
+# Orchestrator — 4-step pipeline
+# =========================================================================
 def _run_video_job(
     job_id: str,
     starting_image_path: Optional[str],
@@ -576,82 +896,181 @@ def _run_video_job(
     camera_motion: str,
     user_id: str,
     starting_image_type: str = "Scene",
+    business_name: str = "",
+    business_category: str = "",
+    product_or_service: str = "",
+    description: str = "",
+    target_audience: str = "",
+    offer: str = "",
+    location: str = "",
+    platform: str = "Instagram Reels",
+    phone: str = "",
+    website: str = "",
+    address: str = "",
+    aspect_ratio: str = "9:16",
+    fast_mode: bool = True,
+    burn_in_text: bool = True,
+    max_parallel_scenes: int = 4,
 ):
-    gemini_model = "gemini-2.5-flash"
-    video_model = "veo-3.1-lite-generate-001"
+    """
+    4-step pipeline:
+      1. Gemini writes a structured JSON ad plan (scenes, camera, VO, style).
+      2. A voiceover script is generated & split into one line per scene.
+      3. Scenes are generated — parallel (fast_mode) or sequential (frame-chained).
+      4. Clips are stitched, trimmed, and text overlaid.
 
+    fast_mode=True (default): all scenes are generated concurrently. Each
+        scene gets a pre-assigned voiceover slice and (if supplied) the same
+        starting_image for style reference — but NOT a frame chained from
+        the previous scene's video, since that would force sequential.
+    fast_mode=False: each scene waits for the previous one to finish so it
+        can use its literal last frame as the next scene's starting image.
+        Slower but tighter pixel-level continuity. Use for a "hero" render.
+    """
     try:
         update_job(job_id, status="processing", progress="Initializing", user_id=user_id)
-        client, gemini_client = _get_genai_clients()
+        veo_client, gemini_client = _get_genai_clients()
 
-        n_segments = max(1, -(-target_seconds // SEGMENT_LEN))  # ceil division
         has_starting = bool(starting_image_path and os.path.exists(starting_image_path))
 
+        # Build the BUSINESS dict from form fields, falling back to ad_text
+        business = {
+            "name": business_name or "",
+            "category": business_category or "All businesses",
+            "product": product_or_service or "",
+            "description": description or ad_text,
+            "audience": target_audience or "general local customers",
+            "language": language_name,
+            "offer": offer or "",
+            "location": location or "",
+            "platform": platform or "Instagram Reels",
+            "duration": target_seconds,
+            "phone": phone or "",
+            "website": website or "",
+            "address": address or "",
+        }
+
         with tempfile.TemporaryDirectory() as tmp_dir:
-            clip_paths = []
-            covered_context = ""
-            current_image = starting_image_path if has_starting else None
+            # --- Step 1: full ad plan with Gemini ---
+            update_job(job_id, progress="Step 1/4: Generating ad plan")
+            plan = call_gemini_plan(gemini_client, business)
+            plan_path = os.path.join(tmp_dir, "plan.json")
+            with open(plan_path, "w") as f:
+                json.dump(plan, f, indent=2)
+            logger.info("Job %s plan: goal=%s, style=%s, cta=%s",
+                        job_id, plan.get("campaign_goal"), plan.get("ad_style"), plan.get("cta"))
 
-            for i in range(n_segments):
-                update_job(job_id, progress=f"Generating segment {i + 1}/{n_segments}")
-                prompt_kwargs = dict(
-                    language_name=language_name,
-                    ad_text=ad_text,
-                    segment_index=i,
-                    covered_context=covered_context,
-                    camera_motion=camera_motion,
-                    starting_image_type=starting_image_type,
-                    has_starting_image=bool(current_image and os.path.exists(current_image)),
-                    is_final_segment=(i == n_segments - 1),
+            # --- Step 2: voiceover script ---
+            update_job(job_id, progress="Step 2/4: Writing voiceover script")
+            voiceover_script = call_gemini_text(
+                gemini_client,
+                build_voiceover_prompt(business, plan.get("voiceover", ""))
+            )
+            logger.info("Job %s voiceover: %.300s", job_id, voiceover_script)
+
+            # --- Step 3: scene generation ---
+            scenes = plan["scenes"]
+            voiceover_lines = _split_voiceover_script(voiceover_script, len(scenes))
+
+            # Pre-compute static summaries for all scenes (doesn't depend on
+            # any scene actually having finished generating yet).
+            static_summaries = []
+            running = ""
+            for scene in scenes:
+                static_summaries.append(running.strip())
+                running += f" {scene.get('visual_description', '')}."
+
+            starting_ref = starting_image_path if has_starting else None
+
+            if fast_mode:
+                n_workers = min(max_parallel_scenes, len(scenes))
+                update_job(
+                    job_id,
+                    progress=f"Step 3/4: Generating {len(scenes)} scenes in parallel "
+                             f"(up to {n_workers} at once)",
                 )
-                prompt_text = build_prompt(**prompt_kwargs)
-
-                def _safe_builder(
-                    _kwargs=prompt_kwargs,
-                ):
-                    return build_prompt(**{**_kwargs, "safe_mode": True, "has_starting_image": False})
-
-                video_bytes, used_prompt = generate_segment(
-                    client,
-                    gemini_client,
-                    gemini_model,
-                    video_model,
-                    current_image,
-                    prompt_text,
-                    safe_retry_prompt_builder=_safe_builder,
+                results = {}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {
+                        pool.submit(
+                            _generate_one_scene, i, scene, business,
+                            gemini_client, veo_client, starting_ref,
+                            static_summaries[i], voiceover_lines[i],
+                            aspect_ratio, tmp_dir,
+                        ): i
+                        for i, scene in enumerate(scenes)
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        i, clip_path, veo_prompt = future.result()
+                        results[i] = clip_path
+                        update_job(
+                            job_id,
+                            progress=f"Step 3/4: Scene {i + 1}/{len(scenes)} done",
+                        )
+                clip_paths = [results[i] for i in range(len(scenes))]
+            else:
+                update_job(
+                    job_id,
+                    progress="Step 3/4: Generating scenes sequentially (frame-chained)",
                 )
+                clip_paths = []
+                current_image = starting_ref
+                for i, scene in enumerate(scenes):
+                    update_job(
+                        job_id,
+                        progress=f"Step 3/4: Scene {i + 1}/{len(scenes)} "
+                                 f"({scene.get('duration_seconds')}s, "
+                                 f"{scene.get('camera_motion')})",
+                    )
+                    _, clip_path, veo_prompt = _generate_one_scene(
+                        i, scene, business, gemini_client, veo_client,
+                        current_image, static_summaries[i], voiceover_lines[i],
+                        aspect_ratio, tmp_dir,
+                    )
+                    clip_paths.append(clip_path)
+                    if i < len(scenes) - 1:
+                        frame_path = os.path.join(tmp_dir, f"scene_{i + 1}_last.jpg")
+                        extract_last_frame(clip_path, frame_path)
+                        current_image = frame_path
 
-                clip_path = os.path.join(tmp_dir, f"seg{i}.mp4")
-                with open(clip_path, "wb") as f:
-                    f.write(video_bytes)
-                clip_paths.append(clip_path)
-                covered_context += " " + used_prompt
-
-                if i < n_segments - 1:
-                    frame_path = os.path.join(tmp_dir, f"seg{i}_last.jpg")
-                    extract_last_frame(clip_path, frame_path)
-                    current_image = frame_path
-
-            update_job(job_id, progress="Finalizing video")
+            # --- Step 4: stitch + overlay ---
+            update_job(job_id, progress="Step 4/4: Stitching clips and adding overlay")
             filename = f"{job_id}.mp4"
-            out_path = os.path.join(GENERATED_DIR, filename)
+            stitched_path = os.path.join(tmp_dir, "stitched_no_overlay.mp4")
 
             if len(clip_paths) == 1:
                 _run_ffmpeg(
                     [
                         "ffmpeg", "-y", "-i", clip_paths[0],
-                        "-t", str(target_seconds), "-c", "copy", out_path,
+                        "-t", str(target_seconds), "-c", "copy", stitched_path,
                     ],
                     label="single-clip trim",
                 )
             else:
                 concat_and_trim(
                     clip_paths,
-                    out_path,
+                    stitched_path,
                     target_seconds,
                     work_dir=tmp_dir,
                 )
 
+            out_path = os.path.join(GENERATED_DIR, filename)
+            if burn_in_text:
+                overlay = build_overlay_text(business)
+                result_path = burn_in_overlay(stitched_path, out_path, overlay, target_seconds)
+                # burn_in_overlay may return in_path if no font found
+                if result_path != out_path:
+                    _run_ffmpeg(
+                        ["ffmpeg", "-y", "-i", result_path, "-c", "copy", out_path],
+                        label="copy to output",
+                    )
+            else:
+                _run_ffmpeg(
+                    ["ffmpeg", "-y", "-i", stitched_path, "-c", "copy", out_path],
+                    label="copy to output",
+                )
+
+        # Upload to S3
         update_job(job_id, progress="Uploading to S3")
         video_url, s3_key = store_generated_media(
             local_path=out_path,
@@ -682,6 +1101,9 @@ def _run_video_job(
                 pass
 
 
+# =========================================================================
+# Pydantic response models
+# =========================================================================
 class VideoGenerateResponse(BaseModel):
     job_id: str
     status: str
@@ -699,6 +1121,9 @@ class VideoStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+# =========================================================================
+# API endpoints
+# =========================================================================
 @router.post("/generate", response_model=VideoGenerateResponse)
 async def api_generate_video(
     ad_text: str = Form(...),
@@ -708,19 +1133,54 @@ async def api_generate_video(
     camera_motion: str = Form("Zoom (In)"),
     starting_image_type: str = Form("Scene"),
     starting_image: Optional[UploadFile] = File(None),
+    # --- New optional fields for plan-first architecture ---
+    business_name: str = Form(""),
+    business_category: str = Form(""),
+    product_or_service: str = Form(""),
+    description: str = Form(""),
+    target_audience: str = Form(""),
+    offer: str = Form(""),
+    location: str = Form(""),
+    platform: str = Form("Instagram Reels"),
+    phone: str = Form(""),
+    website: str = Form(""),
+    address: str = Form(""),
+    aspect_ratio: str = Form("9:16"),
+    fast_mode: bool = Form(True),
+    burn_in_text_overlay: bool = Form(True),
+    max_parallel_scenes: int = Form(4),
 ):
     """
     Starts an async video generation job on a worker thread (can take several minutes).
     On completion, stores under users/{user_id}/generated/videos/ on S3.
 
+    Uses a plan-first architecture:
+      1. Gemini writes a structured JSON ad plan (scenes, camera, VO, style).
+      2. A voiceover script is generated & split into one line per scene.
+      3. Scenes are generated in parallel (fast_mode=True) or sequentially.
+      4. Clips are stitched, trimmed, and business text overlaid.
+
     multipart/form-data fields:
-      - starting_image (optional): first-frame image (Scene/Logo/Product)
-      - starting_image_type: Scene | Logo | Product (default Scene)
-      - ad_text (required): raw ad copy to turn into a voiceover script
-      - user_id (required): logged-in AdvPost user id
-      - language: one of English, Hindi, Marathi (default Marathi)
-      - duration_seconds: one of 8, 16, 30 (default 8)
-      - camera_motion: e.g. "Zoom (In)", "Pan (left)", "Static Shot (or fixed)", etc.
+      Core (required):
+        - ad_text: raw ad copy / business description
+        - user_id: logged-in AdvPost user id
+
+      Existing (optional):
+        - language: one of English, Hindi, Marathi (default Marathi)
+        - duration_seconds: one of 8, 16, 24, 30, 32, 40, 48 (default 8)
+        - camera_motion: e.g. "Zoom (In)", "Pan (left)", etc.
+        - starting_image: first-frame image (Scene/Logo/Product)
+        - starting_image_type: Scene | Logo | Product (default Scene)
+
+      New business detail fields (all optional):
+        - business_name, business_category, product_or_service, description,
+          target_audience, offer, location, platform, phone, website, address
+
+      Generation options (optional):
+        - aspect_ratio: "9:16" or "16:9" (default "9:16")
+        - fast_mode: true for parallel scene gen (default true)
+        - burn_in_text_overlay: true to burn in business text (default true)
+        - max_parallel_scenes: max concurrent Veo calls (default 4)
 
     Returns a job_id. Poll GET /api/video/status/{job_id} until status is
     "completed" (or "failed"), then use video_url (S3 public URL).
@@ -729,8 +1189,10 @@ async def api_generate_video(
         raise HTTPException(400, f"language must be one of {list(_LANGUAGE_CODES)}")
     if duration_seconds not in _ALLOWED_DURATIONS:
         raise HTTPException(400, f"duration_seconds must be one of {sorted(_ALLOWED_DURATIONS)}")
+    if aspect_ratio not in ("9:16", "16:9"):
+        raise HTTPException(400, "aspect_ratio must be '9:16' or '16:9'")
 
-    # Character encourages people shots that Veo RAI blocks (person_generation=dont_allow).
+    # Character encourages people shots that Veo RAI blocks.
     allowed_types = {"Scene", "Logo", "Product", "Character"}
     image_type = (starting_image_type or "Scene").strip()
     if image_type not in allowed_types:
@@ -775,6 +1237,22 @@ async def api_generate_video(
         camera_motion,
         uid,
         image_type,
+        # New fields passed as kwargs
+        business_name=business_name,
+        business_category=business_category,
+        product_or_service=product_or_service,
+        description=description,
+        target_audience=target_audience,
+        offer=offer,
+        location=location,
+        platform=platform,
+        phone=phone,
+        website=website,
+        address=address,
+        aspect_ratio=aspect_ratio,
+        fast_mode=fast_mode,
+        burn_in_text=burn_in_text_overlay,
+        max_parallel_scenes=max_parallel_scenes,
     )
 
     return VideoGenerateResponse(job_id=job_id, status="queued", user_id=uid)
