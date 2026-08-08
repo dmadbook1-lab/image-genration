@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
+httpx
 openai
 google-genai
 pydantic
