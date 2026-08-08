@@ -22,6 +22,7 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, BeforeValidator, WithJsonSchema
 
+from generation_logger import log_generation_event
 from job_runtime import create_job, get_job, submit_job, update_job
 from s3_storage import normalize_user_id, store_generated_media
 
@@ -233,6 +234,16 @@ def _run_image_job(
     reference_image_paths = reference_image_paths or []
     try:
         update_job(job_id, status="processing", progress="Generating image")
+        log_generation_event({
+            "job_id": job_id,
+            "user_id": user_id,
+            "media_kind": "image",
+            "status": "processing",
+            "progress": "Generating image",
+            "final_prompt": prompt,
+            "size": size,
+            "quality": quality,
+        })
 
         generate_image(
             prompt=prompt,
@@ -260,9 +271,26 @@ def _run_image_job(
             s3_key=s3_key,
             filename=f"{job_id}.png",
         )
+        log_generation_event({
+            "job_id": job_id,
+            "user_id": user_id,
+            "media_kind": "image",
+            "status": "completed",
+            "progress": "Done",
+            "output_url": public_url,
+            "s3_key": s3_key,
+            "filename": f"{job_id}.png",
+        })
     except Exception as exc:
         logger.exception("Image job %s failed", job_id)
         update_job(job_id, status="failed", error=str(exc), progress=None)
+        log_generation_event({
+            "job_id": job_id,
+            "user_id": user_id,
+            "media_kind": "image",
+            "status": "failed",
+            "error_message": str(exc),
+        })
         if os.path.exists(output_path):
             try:
                 os.remove(output_path)
@@ -565,6 +593,24 @@ async def api_generate_image(
         language=language,
         error=None,
     )
+
+    log_generation_event({
+        "job_id": job_id,
+        "user_id": uid,
+        "media_kind": "image",
+        "status": "queued",
+        "user_prompt": prompt.strip(),
+        "final_prompt": final_prompt,
+        "language": language,
+        "size": size,
+        "quality": quality,
+        "meta_json": {
+            "has_logo": has_logo,
+            "product_count": product_count,
+            "has_legacy_ref": has_legacy_ref,
+            "color_palette": color_palette.strip() or None,
+        },
+    })
 
     submit_job(
         _run_image_job,

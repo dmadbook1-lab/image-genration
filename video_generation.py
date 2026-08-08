@@ -46,6 +46,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from generation_logger import dumps_json, log_generation_event
 from job_runtime import create_job, get_job, submit_job, update_job
 from s3_storage import normalize_user_id, store_generated_media
 
@@ -63,7 +64,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 VEO_ALLOWED_SEGMENT_SECONDS = (4, 6, 8)  # only these are accepted per Veo call
 _LANGUAGE_CODES = {"English": "en", "Hindi": "hi", "Marathi": "mr"}
-_ALLOWED_DURATIONS = {8, 16, 24, 30, 32, 40, 48}
+# Durations exposed by the Flutter app (create_reel_flow_provider.apiDurationSeconds)
+_ALLOWED_DURATIONS = {8, 16, 30}
 
 VIDEO_MODEL = "veo-3.1-fast-generate-001"
 GEMINI_MODEL = "gemini-3.5-flash"
@@ -288,6 +290,45 @@ def ffmpeg_available() -> bool:
     return which("ffmpeg") is not None
 
 
+_drawtext_available: Optional[bool] = None
+_drawtext_lock = threading.Lock()
+
+
+def drawtext_available() -> bool:
+    """True if this ffmpeg build includes the drawtext filter (needs libfreetype).
+
+    Homebrew's default ffmpeg formula often omits freetype/drawtext, which
+    previously caused Step 4 to fail after Veo clips were already generated.
+    """
+    global _drawtext_available
+    with _drawtext_lock:
+        if _drawtext_available is not None:
+            return _drawtext_available
+        if not ffmpeg_available():
+            _drawtext_available = False
+            return False
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-filters"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            # Filter list lines look like: " T. drawtext           ..."
+            _drawtext_available = bool(re.search(r"\bdrawtext\b", output))
+        except Exception:
+            _drawtext_available = False
+        if not _drawtext_available:
+            logger.warning(
+                "ffmpeg drawtext filter not available — text burn-in will be "
+                "skipped. On macOS reinstall with freetype, e.g. "
+                "`brew reinstall ffmpeg` after enabling libfreetype, or set "
+                "burn_in_text_overlay=false."
+            )
+        return _drawtext_available
+
+
 # =========================================================================
 # ffmpeg helpers (preserved from original, with burn-in addition)
 # =========================================================================
@@ -456,6 +497,31 @@ def _get(business, key, default=""):
     return value if value not in (None, "") else default
 
 
+def _parse_ad_brief(ad_text: str) -> dict:
+    """
+    Pull structured fields out of the Flutter `buildAdText()` brief.
+
+    The mobile app folds business/contact details into `ad_text` — it does not
+    send separate form fields — so this is how we recover name/phone/etc. for
+    planning prompts and optional burn-in overlays.
+    """
+    text = ad_text or ""
+
+    def _line(label: str) -> str:
+        match = re.search(rf"- {re.escape(label)}:\s*(.+)", text, re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    return {
+        "name": _line("Business name"),
+        "category": _line("Business category") or "All businesses",
+        "audience": _line("Target audience") or "general local customers",
+        "phone": _line("Phone"),
+        "website": _line("Website"),
+        "address": _line("Address"),
+        "email": _line("Email"),
+    }
+
+
 def _normalize_category(category):
     return re.sub(r"\s+", " ", re.sub(r"[&,]| and ", " ", category.lower())).strip()
 
@@ -492,24 +558,31 @@ def build_video_plan_prompt(business):
     allowed_str = ", ".join(str(s) for s in VEO_ALLOWED_SEGMENT_SECONDS)
     camera_options_str = ", ".join(_CAMERA_MOTION_OPTIONS)
 
+    preferred_camera = _get(business, "camera_motion", "Zoom (In)")
+
     return f"""
 You are an expert creative director and marketing strategist for small businesses.
 Your job is NOT to generate a video. Your job is to create a complete ad video
 plan for AI video production.
 
-Business details:
+The mobile app sends one advertisement brief in `ad_text`. Use ONLY what is
+present in that brief — do not invent business facts, offers, or contact details.
+
+Business details (parsed / provided):
 - Business name: {name}
 - Category: {category}
-- Product/service: {_get(business, "product")}
-- Description: {_get(business, "description")}
 - Target audience: {_get(business, "audience", "general local customers")}
 - Language: {_get(business, "language", "English")}
-- Offer: {_get(business, "offer")}
-- Location: {_get(business, "location")}
-- Platform: {_get(business, "platform", "Instagram Reels")}
+- Platform: Instagram Reels
 - Duration: {duration} seconds
+- Preferred camera motion: {preferred_camera}
+
+Full advertisement brief from the app:
+{_get(business, "description")}
 
 Create a strong advertising plan that suits this business type.
+Prefer "{preferred_camera}" for most scenes unless another move clearly serves
+the story better (still must be from the allowed camera list).
 
 Scene duration rules (CRITICAL):
 - Each individual scene's "duration_seconds" MUST be exactly one of: {allowed_str}.
@@ -642,20 +715,21 @@ def build_voiceover_prompt(business, voiceover_text):
 You are a professional ad script writer for small business marketing videos.
 
 Write a natural voiceover script in {_get(business, "language", "English")} for
-this business:
+this business using ONLY the advertisement brief from the mobile app:
 
 Business name: {_get(business, "name")}
 Category: {_get(business, "category")}
-Product/service: {_get(business, "product")}
-Offer: {_get(business, "offer")}
 Audience: {_get(business, "audience", "general local customers")}
+
+Full advertisement brief:
+{_get(business, "description")}
 
 Rules:
 - Keep it short, strong, and easy to understand.
 - Make it sound like a real advertisement, not AI-generated wording.
 - Do not invent contact details, prices, or offers not already given below.
 
-Voiceover text:
+Voiceover text from the plan (refine, do not invent new facts):
 {voiceover_text}
 
 Return only the final script.
@@ -670,7 +744,7 @@ def build_overlay_text(business):
     lang = _get(business, "language", "English")
     return {
         "business_name": _get(business, "name"),
-        "offer_text": _get(business, "offer"),
+        "offer_text": "",
         "cta_text": _LANGUAGE_CTA.get(lang, _LANGUAGE_CTA["English"]),
         "phone": _get(business, "phone"),
         "website": _get(business, "website"),
@@ -843,9 +917,16 @@ def _ffmpeg_escape(text):
 
 def burn_in_overlay(in_path, out_path, overlay, total_seconds):
     """Burn business name/CTA (first 3s) and offer/phone/website (last 3s)
-    onto the finished video as lower-third captions. Skips gracefully if no
-    usable font is found on the machine, since the video is still valid
-    without it."""
+    onto the finished video as lower-third captions. Skips gracefully if
+    drawtext/font is unavailable, since the stitched video is still valid.
+    """
+    if not drawtext_available():
+        logger.warning(
+            "ffmpeg drawtext unavailable — skipping burn-in; "
+            "the plain video is still saved."
+        )
+        return in_path
+
     font = _find_font()
     if not font:
         logger.warning(
@@ -876,12 +957,22 @@ def burn_in_overlay(in_path, out_path, overlay, total_seconds):
     if not filters:
         return in_path
 
-    _run_ffmpeg(
-        ["ffmpeg", "-y", "-i", in_path, "-vf", ",".join(filters),
-         "-c:a", "copy", out_path],
-        label="burn-in overlay",
-    )
-    return out_path
+    try:
+        _run_ffmpeg(
+            ["ffmpeg", "-y", "-i", in_path, "-vf", ",".join(filters),
+             "-c:a", "copy", out_path],
+            label="burn-in overlay",
+        )
+        return out_path
+    except RuntimeError as exc:
+        # Last-resort: never fail the whole job after Veo clips succeeded.
+        if "drawtext" in str(exc).lower() or "filter not found" in str(exc).lower():
+            logger.warning(
+                "drawtext burn-in failed (%s) — saving plain video without overlay.",
+                exc,
+            )
+            return in_path
+        raise
 
 
 # =========================================================================
@@ -896,59 +987,54 @@ def _run_video_job(
     camera_motion: str,
     user_id: str,
     starting_image_type: str = "Scene",
-    business_name: str = "",
-    business_category: str = "",
-    product_or_service: str = "",
-    description: str = "",
-    target_audience: str = "",
-    offer: str = "",
-    location: str = "",
-    platform: str = "Instagram Reels",
-    phone: str = "",
-    website: str = "",
-    address: str = "",
-    aspect_ratio: str = "9:16",
-    fast_mode: bool = True,
-    burn_in_text: bool = True,
-    max_parallel_scenes: int = 4,
 ):
     """
-    4-step pipeline:
-      1. Gemini writes a structured JSON ad plan (scenes, camera, VO, style).
-      2. A voiceover script is generated & split into one line per scene.
-      3. Scenes are generated — parallel (fast_mode) or sequential (frame-chained).
-      4. Clips are stitched, trimmed, and text overlaid.
+    4-step pipeline driven only by the mobile app API fields:
+      ad_text, user_id, language, duration_seconds, camera_motion,
+      starting_image_type, starting_image (optional).
 
-    fast_mode=True (default): all scenes are generated concurrently. Each
-        scene gets a pre-assigned voiceover slice and (if supplied) the same
-        starting_image for style reference — but NOT a frame chained from
-        the previous scene's video, since that would force sequential.
-    fast_mode=False: each scene waits for the previous one to finish so it
-        can use its literal last frame as the next scene's starting image.
-        Slower but tighter pixel-level continuity. Use for a "hero" render.
+      1. Gemini writes a structured JSON ad plan from ad_text.
+      2. A voiceover script is generated & split into one line per scene.
+      3. Scenes are generated in parallel (fast) for speed.
+      4. Clips are stitched, trimmed, and text overlaid when ffmpeg allows.
     """
     try:
         update_job(job_id, status="processing", progress="Initializing", user_id=user_id)
+        log_generation_event({
+            "job_id": job_id,
+            "user_id": user_id,
+            "media_kind": "video",
+            "status": "processing",
+            "progress": "Initializing",
+            "user_prompt": ad_text,
+            "language": language_name,
+            "duration_seconds": target_seconds,
+            "camera_motion": camera_motion,
+            "starting_image_type": starting_image_type,
+        })
         veo_client, gemini_client = _get_genai_clients()
 
         has_starting = bool(starting_image_path and os.path.exists(starting_image_path))
+        parsed = _parse_ad_brief(ad_text)
 
-        # Build the BUSINESS dict from form fields, falling back to ad_text
+        # Internal planning dict — sourced from mobile ad_text + API fields only.
         business = {
-            "name": business_name or "",
-            "category": business_category or "All businesses",
-            "product": product_or_service or "",
-            "description": description or ad_text,
-            "audience": target_audience or "general local customers",
+            "name": parsed["name"],
+            "category": parsed["category"],
+            "description": ad_text,
+            "audience": parsed["audience"],
             "language": language_name,
-            "offer": offer or "",
-            "location": location or "",
-            "platform": platform or "Instagram Reels",
             "duration": target_seconds,
-            "phone": phone or "",
-            "website": website or "",
-            "address": address or "",
+            "phone": parsed["phone"],
+            "website": parsed["website"],
+            "address": parsed["address"],
+            "camera_motion": camera_motion,
+            "starting_image_type": starting_image_type,
         }
+        aspect_ratio = "9:16"
+        fast_mode = True
+        burn_in_text = True
+        max_parallel_scenes = 4
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             # --- Step 1: full ad plan with Gemini ---
@@ -959,6 +1045,20 @@ def _run_video_job(
                 json.dump(plan, f, indent=2)
             logger.info("Job %s plan: goal=%s, style=%s, cta=%s",
                         job_id, plan.get("campaign_goal"), plan.get("ad_style"), plan.get("cta"))
+            log_generation_event({
+                "job_id": job_id,
+                "user_id": user_id,
+                "media_kind": "video",
+                "status": "processing",
+                "progress": "Step 1/4: Generating ad plan",
+                "plan_json": dumps_json(plan),
+                "final_prompt": dumps_json({
+                    "campaign_goal": plan.get("campaign_goal"),
+                    "ad_style": plan.get("ad_style"),
+                    "cta": plan.get("cta"),
+                    "scenes_count": len(plan.get("scenes") or []),
+                }),
+            })
 
             # --- Step 2: voiceover script ---
             update_job(job_id, progress="Step 2/4: Writing voiceover script")
@@ -967,6 +1067,14 @@ def _run_video_job(
                 build_voiceover_prompt(business, plan.get("voiceover", ""))
             )
             logger.info("Job %s voiceover: %.300s", job_id, voiceover_script)
+            log_generation_event({
+                "job_id": job_id,
+                "user_id": user_id,
+                "media_kind": "video",
+                "status": "processing",
+                "progress": "Step 2/4: Writing voiceover script",
+                "voiceover_script": voiceover_script,
+            })
 
             # --- Step 3: scene generation ---
             scenes = plan["scenes"]
@@ -981,6 +1089,7 @@ def _run_video_job(
                 running += f" {scene.get('visual_description', '')}."
 
             starting_ref = starting_image_path if has_starting else None
+            scene_prompts: list[str] = [""] * len(scenes)
 
             if fast_mode:
                 n_workers = min(max_parallel_scenes, len(scenes))
@@ -1003,6 +1112,7 @@ def _run_video_job(
                     for future in concurrent.futures.as_completed(futures):
                         i, clip_path, veo_prompt = future.result()
                         results[i] = clip_path
+                        scene_prompts[i] = veo_prompt
                         update_job(
                             job_id,
                             progress=f"Step 3/4: Scene {i + 1}/{len(scenes)} done",
@@ -1028,10 +1138,20 @@ def _run_video_job(
                         aspect_ratio, tmp_dir,
                     )
                     clip_paths.append(clip_path)
+                    scene_prompts[i] = veo_prompt
                     if i < len(scenes) - 1:
                         frame_path = os.path.join(tmp_dir, f"scene_{i + 1}_last.jpg")
                         extract_last_frame(clip_path, frame_path)
                         current_image = frame_path
+
+            log_generation_event({
+                "job_id": job_id,
+                "user_id": user_id,
+                "media_kind": "video",
+                "status": "processing",
+                "progress": "Step 3/4: Scenes generated",
+                "scene_prompts": dumps_json(scene_prompts),
+            })
 
             # --- Step 4: stitch + overlay ---
             update_job(job_id, progress="Step 4/4: Stitching clips and adding overlay")
@@ -1058,7 +1178,7 @@ def _run_video_job(
             if burn_in_text:
                 overlay = build_overlay_text(business)
                 result_path = burn_in_overlay(stitched_path, out_path, overlay, target_seconds)
-                # burn_in_overlay may return in_path if no font found
+                # burn_in_overlay may return in_path if no font/drawtext found
                 if result_path != out_path:
                     _run_ffmpeg(
                         ["ffmpeg", "-y", "-i", result_path, "-c", "copy", out_path],
@@ -1090,9 +1210,29 @@ def _run_video_job(
             filename=filename,
             user_id=user_id,
         )
+        log_generation_event({
+            "job_id": job_id,
+            "user_id": user_id,
+            "media_kind": "video",
+            "status": "completed",
+            "progress": "Done",
+            "output_url": video_url,
+            "s3_key": s3_key,
+            "filename": filename,
+            "scene_prompts": dumps_json(scene_prompts),
+            "plan_json": dumps_json(plan),
+            "voiceover_script": voiceover_script,
+        })
     except Exception as exc:
         logger.exception("Video job %s failed", job_id)
         update_job(job_id, status="failed", error=str(exc))
+        log_generation_event({
+            "job_id": job_id,
+            "user_id": user_id,
+            "media_kind": "video",
+            "status": "failed",
+            "error_message": str(exc),
+        })
     finally:
         if starting_image_path and os.path.exists(starting_image_path):
             try:
@@ -1126,71 +1266,32 @@ class VideoStatusResponse(BaseModel):
 # =========================================================================
 @router.post("/generate", response_model=VideoGenerateResponse)
 async def api_generate_video(
-    ad_text: str = Form(...),
-    user_id: str = Form(...),
+    ad_text: str = Form(..., description="Full ad brief from the mobile app"),
+    user_id: str = Form(..., description="Logged-in AdvPost user id"),
     language: str = Form("Marathi"),
     duration_seconds: int = Form(8),
     camera_motion: str = Form("Zoom (In)"),
     starting_image_type: str = Form("Scene"),
     starting_image: Optional[UploadFile] = File(None),
-    # --- New optional fields for plan-first architecture ---
-    business_name: str = Form(""),
-    business_category: str = Form(""),
-    product_or_service: str = Form(""),
-    description: str = Form(""),
-    target_audience: str = Form(""),
-    offer: str = Form(""),
-    location: str = Form(""),
-    platform: str = Form("Instagram Reels"),
-    phone: str = Form(""),
-    website: str = Form(""),
-    address: str = Form(""),
-    aspect_ratio: str = Form("9:16"),
-    fast_mode: bool = Form(True),
-    burn_in_text_overlay: bool = Form(True),
-    max_parallel_scenes: int = Form(4),
 ):
     """
-    Starts an async video generation job on a worker thread (can take several minutes).
-    On completion, stores under users/{user_id}/generated/videos/ on S3.
+    Starts an async video generation job (same fields the Flutter app sends).
 
-    Uses a plan-first architecture:
-      1. Gemini writes a structured JSON ad plan (scenes, camera, VO, style).
-      2. A voiceover script is generated & split into one line per scene.
-      3. Scenes are generated in parallel (fast_mode=True) or sequentially.
-      4. Clips are stitched, trimmed, and business text overlaid.
+    multipart/form-data:
+      - ad_text (required): full brief from MediaGenerationService / buildAdText()
+      - user_id (required): AdvPost user id
+      - language: English | Hindi | Marathi (default Marathi)
+      - duration_seconds: 8 | 16 | 30 (default 8)
+      - camera_motion: e.g. Zoom (In)
+      - starting_image_type: Scene | Logo | Product (default Scene)
+      - starting_image: optional first-frame image file
 
-    multipart/form-data fields:
-      Core (required):
-        - ad_text: raw ad copy / business description
-        - user_id: logged-in AdvPost user id
-
-      Existing (optional):
-        - language: one of English, Hindi, Marathi (default Marathi)
-        - duration_seconds: one of 8, 16, 24, 30, 32, 40, 48 (default 8)
-        - camera_motion: e.g. "Zoom (In)", "Pan (left)", etc.
-        - starting_image: first-frame image (Scene/Logo/Product)
-        - starting_image_type: Scene | Logo | Product (default Scene)
-
-      New business detail fields (all optional):
-        - business_name, business_category, product_or_service, description,
-          target_audience, offer, location, platform, phone, website, address
-
-      Generation options (optional):
-        - aspect_ratio: "9:16" or "16:9" (default "9:16")
-        - fast_mode: true for parallel scene gen (default true)
-        - burn_in_text_overlay: true to burn in business text (default true)
-        - max_parallel_scenes: max concurrent Veo calls (default 4)
-
-    Returns a job_id. Poll GET /api/video/status/{job_id} until status is
-    "completed" (or "failed"), then use video_url (S3 public URL).
+    Returns job_id. Poll GET /api/video/status/{job_id} for video_url.
     """
     if language not in _LANGUAGE_CODES:
         raise HTTPException(400, f"language must be one of {list(_LANGUAGE_CODES)}")
     if duration_seconds not in _ALLOWED_DURATIONS:
         raise HTTPException(400, f"duration_seconds must be one of {sorted(_ALLOWED_DURATIONS)}")
-    if aspect_ratio not in ("9:16", "16:9"):
-        raise HTTPException(400, "aspect_ratio must be '9:16' or '16:9'")
 
     # Character encourages people shots that Veo RAI blocks.
     allowed_types = {"Scene", "Logo", "Product", "Character"}
@@ -1227,6 +1328,21 @@ async def api_generate_video(
         error=None,
     )
 
+    log_generation_event({
+        "job_id": job_id,
+        "user_id": uid,
+        "media_kind": "video",
+        "status": "queued",
+        "user_prompt": ad_text,
+        "language": language,
+        "duration_seconds": duration_seconds,
+        "camera_motion": camera_motion,
+        "starting_image_type": image_type,
+        "meta_json": {
+            "has_starting_image": bool(tmp_image_path),
+        },
+    })
+
     submit_job(
         _run_video_job,
         job_id,
@@ -1237,22 +1353,6 @@ async def api_generate_video(
         camera_motion,
         uid,
         image_type,
-        # New fields passed as kwargs
-        business_name=business_name,
-        business_category=business_category,
-        product_or_service=product_or_service,
-        description=description,
-        target_audience=target_audience,
-        offer=offer,
-        location=location,
-        platform=platform,
-        phone=phone,
-        website=website,
-        address=address,
-        aspect_ratio=aspect_ratio,
-        fast_mode=fast_mode,
-        burn_in_text=burn_in_text_overlay,
-        max_parallel_scenes=max_parallel_scenes,
     )
 
     return VideoGenerateResponse(job_id=job_id, status="queued", user_id=uid)

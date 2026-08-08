@@ -38,6 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from image_generation import router as image_router
+from media_library import router as media_library_router
 from video_generation import router as video_router
 
 app = FastAPI(title="Media Generation API", version="1.0.0")
@@ -61,6 +62,7 @@ app.mount("/files", StaticFiles(directory=GENERATED_DIR), name="files")
 
 app.include_router(image_router)
 app.include_router(video_router)
+app.include_router(media_library_router)
 
 
 @app.on_event("startup")

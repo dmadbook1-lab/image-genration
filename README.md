@@ -100,7 +100,7 @@ If `status == "failed"`, check the `error` field for details.
 
 ### 2. Generate a video — asynchronous job
 
-Video generation can take a few minutes (Veo generates in 8-second segments
+Video generation can take a few minutes (Veo generates scene clips
 and stitches them together), so this is a **job pattern**: start the job,
 poll status, then load the finished file.
 
@@ -109,14 +109,17 @@ poll status, then load the finished file.
 `POST /api/video/generate`
 Content-Type: `multipart/form-data`
 
+Same fields the Flutter app sends (`MediaGenerationService.startVideoGeneration`):
+
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `starting_image` | file | yes | first-frame image |
-| `ad_text` | string | yes | raw ad copy to turn into a voiceover script |
+| `ad_text` | string | yes | full brief from `buildAdText()` (business + message + style + contact) |
 | `user_id` | string | yes | logged-in AdvPost user id (S3 folder) |
 | `language` | string | no | `English` \| `Hindi` \| `Marathi` (default `Marathi`) |
-| `duration_seconds` | int | no | `8` \| `16` \| `30` (default `30`) |
-| `camera_motion` | string | no | e.g. `Zoom (In)`, `Pan (left)`, `Static Shot (or fixed)` (default `Zoom (In)`) |
+| `duration_seconds` | int | no | `8` \| `16` \| `30` (default `8`) |
+| `camera_motion` | string | no | e.g. `Zoom (In)` (default `Zoom (In)`) |
+| `starting_image_type` | string | no | `Scene` \| `Logo` \| `Product` (default `Scene`) |
+| `starting_image` | file | no | optional first-frame image |
 
 **Response `200`:**
 ```json

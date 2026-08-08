@@ -182,3 +182,51 @@ def store_generated_media(
     if public_base:
         return f"{public_base}/files/{safe_name}", ""
     return f"/files/{safe_name}", ""
+
+
+def list_user_generated_media(
+    user_id: str,
+    media_kind: str,
+) -> list[dict]:
+    """
+    List objects under users/{user_id}/generated/{images|videos}/.
+    Returns dicts: filename, url, s3_key, size_bytes, last_modified (iso).
+    """
+    require_s3()
+    uid = normalize_user_id(user_id)
+    kind = (media_kind or "").strip().lower()
+    if kind not in {"images", "videos"}:
+        raise ValueError("media_kind must be 'images' or 'videos'")
+
+    bucket = os.environ["AWS_BUCKET_NAME"]
+    prefix = f"users/{uid}/generated/{kind}/"
+    client = _get_s3_client()
+
+    items: list[dict] = []
+    continuation: Optional[str] = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 200}
+        if continuation:
+            kwargs["ContinuationToken"] = continuation
+        resp = client.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents") or []:
+            key = obj.get("Key") or ""
+            if key.endswith("/") or key == prefix:
+                continue
+            filename = key.rsplit("/", 1)[-1]
+            if not filename:
+                continue
+            last_mod = obj.get("LastModified")
+            items.append(
+                {
+                    "filename": filename,
+                    "url": s3_public_url(key),
+                    "s3_key": key,
+                    "size_bytes": obj.get("Size"),
+                    "last_modified": last_mod.isoformat() if last_mod else None,
+                }
+            )
+        if not resp.get("IsTruncated"):
+            break
+        continuation = resp.get("NextContinuationToken")
+    return items
