@@ -63,7 +63,33 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 VEO_ALLOWED_SEGMENT_SECONDS = (4, 6, 8)  # only these are accepted per Veo call
-_LANGUAGE_CODES = {"English": "en", "Hindi": "hi", "Marathi": "mr"}
+# Language name → ISO-ish code (used for allowlist validation; voiceover uses the name).
+# Includes English + the 22 scheduled languages of India.
+_LANGUAGE_CODES = {
+    "English": "en",
+    "Hindi": "hi",
+    "Bengali": "bn",
+    "Telugu": "te",
+    "Marathi": "mr",
+    "Tamil": "ta",
+    "Urdu": "ur",
+    "Gujarati": "gu",
+    "Kannada": "kn",
+    "Odia": "or",
+    "Malayalam": "ml",
+    "Punjabi": "pa",
+    "Assamese": "as",
+    "Maithili": "mai",
+    "Santali": "sat",
+    "Kashmiri": "ks",
+    "Nepali": "ne",
+    "Konkani": "kok",
+    "Sindhi": "sd",
+    "Dogri": "doi",
+    "Manipuri": "mni",
+    "Bodo": "brx",
+    "Sanskrit": "sa",
+}
 # Durations exposed by the Flutter app (create_reel_flow_provider.apiDurationSeconds)
 _ALLOWED_DURATIONS = {8, 16, 30}
 
@@ -94,7 +120,27 @@ _CAMERA_MOTION_OPTIONS = [
 _LANGUAGE_CTA = {
     "English": "Call Now",
     "Hindi": "Abhi Call Karein",
+    "Bengali": "Ekhon Call Korun",
+    "Telugu": "Ippudu Call Cheyandi",
     "Marathi": "Aatach Call Kara",
+    "Tamil": "Ippe Call Seyunga",
+    "Urdu": "Abhi Call Karein",
+    "Gujarati": "Have Call Karo",
+    "Kannada": "Eega Call Maadi",
+    "Odia": "Ebe Call Karantu",
+    "Malayalam": "Ippol Call Cheyyu",
+    "Punjabi": "Hun Call Karo",
+    "Assamese": "Etiya Call Korok",
+    "Maithili": "Abhi Call Karu",
+    "Santali": "Call Now",
+    "Kashmiri": "Call Now",
+    "Nepali": "Ahile Call Garnuhos",
+    "Konkani": "Atam Call Kara",
+    "Sindhi": "Call Now",
+    "Dogri": "Call Now",
+    "Manipuri": "Call Now",
+    "Bodo": "Call Now",
+    "Sanskrit": "Call Now",
 }
 
 # ---------------------------------------------------------------------------
@@ -1280,7 +1326,7 @@ async def api_generate_video(
     multipart/form-data:
       - ad_text (required): full brief from MediaGenerationService / buildAdText()
       - user_id (required): AdvPost user id
-      - language: English | Hindi | Marathi (default Marathi)
+      - language: Indian language name or English (default Marathi)
       - duration_seconds: 8 | 16 | 30 (default 8)
       - camera_motion: e.g. Zoom (In)
       - starting_image_type: Scene | Logo | Product (default Scene)
