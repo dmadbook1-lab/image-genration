@@ -1006,7 +1006,7 @@ def burn_in_overlay(in_path, out_path, overlay, total_seconds):
     try:
         _run_ffmpeg(
             ["ffmpeg", "-y", "-i", in_path, "-vf", ",".join(filters),
-             "-c:a", "copy", out_path],
+             "-c:a", "copy", "-movflags", "+faststart", out_path],
             label="burn-in overlay",
         )
         return out_path
@@ -1078,7 +1078,7 @@ def _run_video_job(
             "starting_image_type": starting_image_type,
         }
         aspect_ratio = "9:16"
-        fast_mode = True
+        fast_mode = False
         burn_in_text = True
         max_parallel_scenes = 4
 
@@ -1227,12 +1227,14 @@ def _run_video_job(
                 # burn_in_overlay may return in_path if no font/drawtext found
                 if result_path != out_path:
                     _run_ffmpeg(
-                        ["ffmpeg", "-y", "-i", result_path, "-c", "copy", out_path],
+                        ["ffmpeg", "-y", "-i", result_path, "-c", "copy",
+                         "-movflags", "+faststart", out_path],
                         label="copy to output",
                     )
             else:
                 _run_ffmpeg(
-                    ["ffmpeg", "-y", "-i", stitched_path, "-c", "copy", out_path],
+                    ["ffmpeg", "-y", "-i", stitched_path, "-c", "copy",
+                     "-movflags", "+faststart", out_path],
                     label="copy to output",
                 )
 
