@@ -98,6 +98,11 @@ GEMINI_MODEL = "gemini-3.5-flash"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 10
+# Gemini/Vertex quota errors (429 RESOURCE_EXHAUSTED) reset on a per-minute
+# window, not instantly — the plain 10s/20s backoff below can burn through
+# all retries before that window rolls over. Wait long enough to actually
+# clear it instead of failing the whole job on a transient burst.
+QUOTA_RETRY_BACKOFF_SECONDS = 35
 
 router = APIRouter(prefix="/api/video", tags=["video"])
 
