@@ -21,11 +21,29 @@ users/{user_id}/generated/videos/{id}.mp4
 
 ```bash
 cp .env.example .env   # fill OPENAI_API_KEY, GCP project, and AWS_* keys
-pip install -r requirements.txt
-# ffmpeg required for video segment stitching (macOS: brew install ffmpeg)
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# ffmpeg WITH the drawtext filter is required (stitching + text overlays).
+#   Debian/Ubuntu: sudo apt-get install -y ffmpeg   (includes drawtext)
+#   macOS: brew install ffmpeg-full, then set
+#          FFMPEG_BINARY=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg in .env
+#          (Homebrew's plain `ffmpeg` formula lacks drawtext)
 
-uvicorn main:app --host 0.0.0.0 --port 8000
+.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+Check `GET /health` — it must report `"ffmpeg": "ok"` and `"drawtext": "ok"`,
+otherwise videos are saved without their text overlay.
+
+**Production checklist**
+- Leave `MEDIA_PUBLIC_BASE_URL` and `KEEP_LOCAL_MEDIA` unset so the app receives S3 URLs
+  (they are for the local Android emulator only).
+- `/health` shows `drawtext: ok`.
+- GCP project has billing and the Vertex AI API enabled.
+
+**Local storage instead of S3:** set `MEDIA_STORAGE=local` to save each user's media in
+`generated/users/{user_id}/images/` and `generated/users/{user_id}/videos/` with no S3 upload.
+URLs become `{MEDIA_PUBLIC_BASE_URL}/files/users/{user_id}/videos/{id}.mp4`, `s3_key` holds the
+path relative to `generated/`, and `GET /api/media/generated` lists those folders.
 
 AWS keys must match the PHP backend (`aws_credential` table / `application/config/aws.php`).
 `S3_REQUIRED=1` (default) means generation fails if S3 is not configured.
@@ -37,7 +55,7 @@ Optional performance tuning in `.env`:
 Jobs run on a thread pool so `/health` and `/status` stay responsive while generation is in progress.
 
 Video auth uses the bundled GCP **service account** JSON
-(`video-generation-veo-502109-7f1a9e95d0c7.json`). Override the path with
+(`advpost-video-27ad9b6f9358.json`). Override the path with
 `GOOGLE_APPLICATION_CREDENTIALS` if needed. No `gcloud auth` login is required.
 
 ---
@@ -120,6 +138,10 @@ Same fields the Flutter app sends (`MediaGenerationService.startVideoGeneration`
 | `camera_motion` | string | no | e.g. `Zoom (In)` (default `Zoom (In)`) |
 | `starting_image_type` | string | no | `Scene` \| `Logo` \| `Product` (default `Scene`) |
 | `starting_image` | file | no | optional first-frame image |
+| `cta_text` | string | no | overlay button text shown with the business name in the first 3s (default per language, e.g. `Call Now`) |
+
+Name, phone and website for the overlay are read from `ad_text` lines written as
+`- Business name: …`, `- Phone: …`, `- Website: …`.
 
 **Response `200`:**
 ```json

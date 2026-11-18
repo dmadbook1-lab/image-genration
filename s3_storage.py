@@ -1,9 +1,14 @@
 """
-Upload generated media to AWS S3 (bucket: advpost).
+Store generated media per user — on AWS S3 (bucket: advpost) or, with
+MEDIA_STORAGE=local, in this project's generated/ folder.
 
-Canonical layout (same as PHP media_helper):
+Canonical S3 layout (same as PHP media_helper):
   users/{user_id}/generated/images/{filename}
   users/{user_id}/generated/videos/{filename}
+
+Local layout (served by main.py at /files/...):
+  generated/users/{user_id}/images/{filename}
+  generated/users/{user_id}/videos/{filename}
 """
 
 from __future__ import annotations
@@ -11,10 +16,14 @@ from __future__ import annotations
 import mimetypes
 import os
 import re
+import shutil
 import threading
+from datetime import datetime, timezone
 from typing import Optional
 
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+GENERATED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated")
 
 _s3_client = None
 _s3_client_lock = threading.Lock()
@@ -27,6 +36,11 @@ def s3_enabled() -> bool:
         and os.environ.get("AWS_SECRET_ACCESS_KEY")
         and os.environ.get("AWS_BUCKET_NAME")
     )
+
+
+def local_storage_enabled() -> bool:
+    """MEDIA_STORAGE=local keeps media in generated/users/... and skips S3."""
+    return (os.environ.get("MEDIA_STORAGE") or "s3").strip().lower() == "local"
 
 
 def s3_required() -> bool:
@@ -60,16 +74,32 @@ def safe_filename(name: str) -> str:
     return base or "file.bin"
 
 
+def _media_kind(media_kind: str) -> str:
+    kind = (media_kind or "").strip().lower()
+    if kind not in {"images", "videos"}:
+        raise ValueError("media_kind must be 'images' or 'videos'")
+    return kind
+
+
 def user_generated_key(user_id: str, media_kind: str, filename: str) -> str:
     """
     media_kind: 'images' | 'videos'
     → users/{user_id}/generated/{media_kind}/{filename}
     """
     uid = normalize_user_id(user_id)
-    kind = (media_kind or "").strip().lower()
-    if kind not in {"images", "videos"}:
-        raise ValueError("media_kind must be 'images' or 'videos'")
-    return f"users/{uid}/generated/{kind}/{safe_filename(filename)}"
+    return f"users/{uid}/generated/{_media_kind(media_kind)}/{safe_filename(filename)}"
+
+
+def user_local_key(user_id: str, media_kind: str, filename: str) -> str:
+    """Path relative to generated/ (and to /files/): users/{user_id}/{media_kind}/{filename}"""
+    uid = normalize_user_id(user_id)
+    return f"users/{uid}/{_media_kind(media_kind)}/{safe_filename(filename)}"
+
+
+def local_public_url(local_key: str) -> str:
+    """URL main.py serves generated/{local_key} at; absolute when MEDIA_PUBLIC_BASE_URL is set."""
+    public_base = (os.environ.get("MEDIA_PUBLIC_BASE_URL") or "").rstrip("/")
+    return f"{public_base}/files/{local_key}"
 
 
 def s3_public_url(key: str) -> str:
@@ -156,10 +186,21 @@ def store_generated_media(
     Upload generated media under the user's S3 folder.
     Returns (public_url, s3_key).
 
+    With MEDIA_STORAGE=local, move the file into generated/users/{user_id}/
+    {media_kind}/ instead and return (its /files URL, path relative to
+    generated/) — nothing is uploaded.
+
     When MEDIA_PUBLIC_BASE_URL is set (local/dev), keep the file on disk and
     return that base + /files/{filename} so Android emulators can load media
     without needing public DNS to reach S3.
     """
+    if local_storage_enabled():
+        local_key = user_local_key(user_id, media_kind, filename)
+        dest = os.path.join(GENERATED_DIR, *local_key.split("/"))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(local_path, dest)  # rename, or copy+delete across devices
+        return local_public_url(local_key), local_key
+
     public_base = (os.environ.get("MEDIA_PUBLIC_BASE_URL") or "").rstrip("/")
     keep_local_raw = (os.environ.get("KEEP_LOCAL_MEDIA") or "").strip().lower()
     keep_local = keep_local_raw in {"1", "true", "yes", "on"} or bool(public_base)
@@ -189,14 +230,16 @@ def list_user_generated_media(
     media_kind: str,
 ) -> list[dict]:
     """
-    List objects under users/{user_id}/generated/{images|videos}/.
+    List objects under users/{user_id}/generated/{images|videos}/
+    (or generated/users/{user_id}/{images|videos}/ with MEDIA_STORAGE=local).
     Returns dicts: filename, url, s3_key, size_bytes, last_modified (iso).
     """
-    require_s3()
     uid = normalize_user_id(user_id)
-    kind = (media_kind or "").strip().lower()
-    if kind not in {"images", "videos"}:
-        raise ValueError("media_kind must be 'images' or 'videos'")
+    kind = _media_kind(media_kind)
+    if local_storage_enabled():
+        return _list_local_user_media(uid, kind)
+
+    require_s3()
 
     bucket = os.environ["AWS_BUCKET_NAME"]
     prefix = f"users/{uid}/generated/{kind}/"
@@ -229,4 +272,29 @@ def list_user_generated_media(
         if not resp.get("IsTruncated"):
             break
         continuation = resp.get("NextContinuationToken")
+    return items
+
+
+def _list_local_user_media(uid: str, kind: str) -> list[dict]:
+    """Local twin of the S3 listing: files in generated/users/{uid}/{kind}/."""
+    folder = os.path.join(GENERATED_DIR, "users", uid, kind)
+    if not os.path.isdir(folder):
+        return []
+
+    items: list[dict] = []
+    for entry in os.scandir(folder):
+        # Skip folders and dotfiles (incl. macOS ._ AppleDouble files).
+        if not entry.is_file() or entry.name.startswith("."):
+            continue
+        local_key = f"users/{uid}/{kind}/{entry.name}"
+        stat = entry.stat()
+        items.append(
+            {
+                "filename": entry.name,
+                "url": local_public_url(local_key),
+                "s3_key": local_key,
+                "size_bytes": stat.st_size,
+                "last_modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            }
+        )
     return items

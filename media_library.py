@@ -1,5 +1,5 @@
 """
-List previously generated media for a user from S3.
+List previously generated media for a user (S3, or local with MEDIA_STORAGE=local).
 
 GET /api/media/generated?user_id=...&kind=all|images|videos
 """
@@ -39,7 +39,7 @@ async def list_generated_media(
     user_id: str = Query(..., description="Logged-in AdvPost user id"),
     kind: str = Query("all", description="all | images | videos"),
 ):
-    """Return the user's AI-generated posters and reels still on S3."""
+    """Return the user's AI-generated posters and reels."""
     try:
         uid = normalize_user_id(user_id)
     except ValueError as exc:

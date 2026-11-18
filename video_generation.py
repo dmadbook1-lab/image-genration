@@ -4,9 +4,9 @@ Video generation module — Veo 3.1 + Gemini (Google Vertex AI).
 Plan-first architecture:
   1. Gemini writes a structured JSON ad plan (scenes, camera moves, voiceover,
      hashtags, on-screen text) based on business details.
-  2. A full voiceover script is generated, then deterministically split into
-     one line per scene so each scene's Veo prompt asks Veo to speak its own
-     slice aloud (generate_audio=True).
+  2. Gemini writes one voiceover line per scene, matched to that scene's
+     visuals and sized to fit its duration, so each scene's Veo prompt asks
+     Veo to speak its own line aloud (generate_audio=True).
   3. Each scene gets its own focused, category-aware Veo prompt with safety
      rules and per-category "suggested movement" library.
   4. Scenes are generated in parallel (fast_mode) or sequentially
@@ -55,7 +55,7 @@ GENERATED_DIR = os.path.join(_MODULE_DIR, "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
 # Default Veo service account key shipped with this service.
-_DEFAULT_SA_JSON = _MODULE_DIR / "video-generation-veo-502109-7f1a9e95d0c7.json"
+_DEFAULT_SA_JSON = _MODULE_DIR / "advpost-video-27ad9b6f9358.json"
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,11 @@ RETRY_BACKOFF_SECONDS = 10
 # all retries before that window rolls over. Wait long enough to actually
 # clear it instead of failing the whole job on a transient burst.
 QUOTA_RETRY_BACKOFF_SECONDS = 35
+
+# ffmpeg binary to run. Point FFMPEG_BINARY at a build with drawtext
+# (libfreetype) when the one on PATH lacks it, e.g. Homebrew's keg-only
+# /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg.
+FFMPEG_BIN = os.environ.get("FFMPEG_BINARY", "").strip() or "ffmpeg"
 
 router = APIRouter(prefix="/api/video", tags=["video"])
 
@@ -276,7 +281,7 @@ def _get_vertex_credentials():
         if not path.is_file():
             raise RuntimeError(
                 f"GCP service account JSON not found at {path}. "
-                "Place video-generation-veo-502109-7f1a9e95d0c7.json beside "
+                "Place advpost-video-27ad9b6f9358.json beside "
                 "video_generation.py or set GOOGLE_APPLICATION_CREDENTIALS."
             )
         scopes = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -338,7 +343,7 @@ def ffmpeg_available() -> bool:
     """True if the ffmpeg binary is on PATH."""
     from shutil import which
 
-    return which("ffmpeg") is not None
+    return which(FFMPEG_BIN) is not None
 
 
 _drawtext_available: Optional[bool] = None
@@ -360,7 +365,7 @@ def drawtext_available() -> bool:
             return False
         try:
             result = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-filters"],
+                [FFMPEG_BIN, "-hide_banner", "-filters"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -372,10 +377,11 @@ def drawtext_available() -> bool:
             _drawtext_available = False
         if not _drawtext_available:
             logger.warning(
-                "ffmpeg drawtext filter not available — text burn-in will be "
-                "skipped. On macOS reinstall with freetype, e.g. "
-                "`brew reinstall ffmpeg` after enabling libfreetype, or set "
-                "burn_in_text_overlay=false."
+                "ffmpeg drawtext filter not available in %r — text burn-in "
+                "will be skipped. Install an ffmpeg built with libfreetype "
+                "(macOS: `brew install ffmpeg-full`; Debian/Ubuntu: apt's "
+                "ffmpeg has it) and set FFMPEG_BINARY to its path.",
+                FFMPEG_BIN,
             )
         return _drawtext_available
 
@@ -414,68 +420,79 @@ def _run_ffmpeg(cmd: list[str], *, label: str) -> None:
 def extract_last_frame(video_path, frame_path):
     _run_ffmpeg(
         [
-            "ffmpeg", "-y", "-sseof", "-1", "-i", video_path,
+            FFMPEG_BIN, "-y", "-sseof", "-1", "-i", video_path,
             "-update", "1", "-q:v", "1", frame_path,
         ],
         label="extract last frame",
     )
 
 
-def concat_and_trim(clip_paths, out_path, target_seconds, work_dir=None):
-    """Concatenate segment clips, then trim to target_seconds.
+_OUTPUT_FPS = 24
+_OUTPUT_SIZE = {"9:16": (720, 1280), "16:9": (1280, 720)}
+# Short fades at each cut so joined clips don't click/pop.
+_CUT_AUDIO_FADE_SECONDS = 0.04
 
-    Prefers stream-copy for speed; falls back to re-encode when codecs differ.
-    Intermediate files stay in work_dir (or next to out_path).
+
+def _has_audio_stream(path: str) -> bool:
+    result = subprocess.run(
+        [FFMPEG_BIN, "-hide_banner", "-i", path], capture_output=True, text=True
+    )
+    return "Audio:" in (result.stderr or "")
+
+
+def concat_and_trim(clip_paths, out_path, target_seconds, durations=None, aspect_ratio="9:16"):
+    """Join scene clips with audio and video locked together, then trim to
+    target_seconds.
+
+    Veo clips' audio runs slightly longer than their video and the video
+    starts a frame late. Stream-copy concat collapses those gaps, so the voice
+    drifts further ahead at every cut. Instead, each clip is cut to exactly its
+    scene duration (video frame-padded, audio padded/trimmed to the same
+    length, both reset to t=0) before the concat filter joins them.
     """
-    work = work_dir or os.path.dirname(out_path) or "."
-    os.makedirs(work, exist_ok=True)
+    durations = list(durations or [])
+    width, height = _OUTPUT_SIZE.get(aspect_ratio, _OUTPUT_SIZE["9:16"])
+    fade = _CUT_AUDIO_FADE_SECONDS
 
-    list_file = os.path.join(work, "concat_list.txt")
-    concat_path = os.path.join(work, "concat_full.mp4")
+    cmd = [FFMPEG_BIN, "-y"]
+    for p in clip_paths:
+        cmd += ["-i", p]
 
-    with open(list_file, "w") as f:
-        for p in clip_paths:
-            # Escape single quotes for the concat demuxer.
-            abs_path = os.path.abspath(p).replace("'", r"'\''")
-            f.write(f"file '{abs_path}'\n")
+    parts, concat_inputs = [], ""
+    for i, path in enumerate(clip_paths):
+        dur = durations[i] if i < len(durations) and durations[i] else None
+        if dur is None:
+            raise ValueError(f"missing duration for clip {i + 1}")
+        parts.append(
+            f"[{i}:v]setpts=PTS-STARTPTS,fps={_OUTPUT_FPS},"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+            f"tpad=stop_mode=clone:stop_duration=1,trim=duration={dur},"
+            f"setpts=PTS-STARTPTS[v{i}]"
+        )
+        if _has_audio_stream(path):
+            audio_src = f"[{i}:a]asetpts=PTS-STARTPTS,aresample=48000,"
+        else:
+            audio_src = f"anullsrc=r=48000:cl=stereo,"
+        parts.append(
+            f"{audio_src}aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"apad=whole_dur={dur},atrim=duration={dur},"
+            f"afade=t=in:d={fade},afade=t=out:st={dur - fade}:d={fade},"
+            f"asetpts=PTS-STARTPTS[a{i}]"
+        )
+        concat_inputs += f"[v{i}][a{i}]"
+    parts.append(f"{concat_inputs}concat=n={len(clip_paths)}:v=1:a=1[v][a]")
 
-    copy_cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", list_file, "-c", "copy", concat_path,
-    ]
-    try:
-        _run_ffmpeg(copy_cmd, label="concat (copy)")
-    except RuntimeError as copy_err:
-        # Veo segments can differ in codec/params — re-encode as a fallback.
-        logger.warning("Stream-copy concat failed, re-encoding: %s", copy_err)
-        reencode_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", list_file,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            concat_path,
-        ]
-        _run_ffmpeg(reencode_cmd, label="concat (re-encode)")
-
-    trim_cmd = [
-        "ffmpeg", "-y", "-i", concat_path,
+    cmd += [
+        "-filter_complex", ";".join(parts),
+        "-map", "[v]", "-map", "[a]",
         "-t", str(target_seconds),
-        "-c", "copy",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
         out_path,
     ]
-    try:
-        _run_ffmpeg(trim_cmd, label="trim (copy)")
-    except RuntimeError:
-        trim_reencode = [
-            "ffmpeg", "-y", "-i", concat_path,
-            "-t", str(target_seconds),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            out_path,
-        ]
-        _run_ffmpeg(trim_reencode, label="trim (re-encode)")
+    _run_ffmpeg(cmd, label="sync concat")
 
 
 def _wait_for_video_operation(client, operation, poll_seconds=8, max_wait=900):
@@ -548,6 +565,9 @@ def _get(business, key, default=""):
     return value if value not in (None, "") else default
 
 
+_MAX_BRIEF_FIELD_CHARS = 120
+
+
 def _parse_ad_brief(ad_text: str) -> dict:
     """
     Pull structured fields out of the Flutter `buildAdText()` brief.
@@ -559,8 +579,17 @@ def _parse_ad_brief(ad_text: str) -> dict:
     text = ad_text or ""
 
     def _line(label: str) -> str:
-        match = re.search(rf"- {re.escape(label)}:\s*(.+)", text, re.IGNORECASE)
-        return match.group(1).strip() if match else ""
+        # Stop at the line end, a run of 2+ spaces, or the next "- Label:" so a
+        # brief whose newlines were flattened can't swallow the rest of the text.
+        match = re.search(
+            rf"-\s*{re.escape(label)}:[ \t]*(.+?)(?=\n|\s{{2,}}|\s-\s*[A-Za-z][A-Za-z ]{{0,30}}:|$)",
+            text,
+            re.IGNORECASE,
+        )
+        value = match.group(1).strip() if match else ""
+        if value.startswith("<") or len(value) > _MAX_BRIEF_FIELD_CHARS:
+            return ""  # unfilled template placeholder or not a real field value
+        return value
 
     return {
         "name": _line("Business name"),
@@ -707,14 +736,19 @@ def _split_voiceover_script(voiceover_script, n_scenes):
 # =========================================================================
 def build_scene_prompt(business, scene, previous_scene_summary="", voiceover_line=""):
     """One focused Veo prompt per scene. voiceover_line is this scene's
-    pre-assigned slice of the overall VO script (see _split_voiceover_script)
+    pre-assigned voiceover line (see parse_voiceover_lines)
     — deciding it up front instead of asking Gemini to infer "what hasn't been
     said yet" is what lets scenes be built independently / in parallel."""
     motion_rules = _motion_rules(scene.get("camera_motion"), _get(business, "category", "General"))
     language = _get(business, "language", "English")
+    duration = scene.get("duration_seconds") or 8
     voiceover_instruction = (
         f'- Voiceover: have the scene\'s spoken audio deliver, in {language}, '
-        f'in a natural energetic announcer voice: "{voiceover_line}"'
+        f'in a natural, clear announcer voice: "{voiceover_line}"\n'
+        f"- Voiceover timing: speak this line exactly once, starting about "
+        f"0.5 seconds into the {duration}-second clip and finishing at least "
+        f"0.5 seconds before it ends, at a calm pace. Never cut off mid-word. "
+        f"No other spoken words, and no singing or vocals in the music."
         if voiceover_line else
         f"- Voiceover: no line is assigned to this scene — include only "
         f"natural ambient/background sound, no spoken words."
@@ -760,13 +794,50 @@ Rules:
 # =========================================================================
 # Step 3: voiceover script prompt
 # =========================================================================
-def build_voiceover_prompt(business, voiceover_text):
-    """A clean voiceover script, meant for a separate TTS/dub pass."""
+# Narration pace Veo can speak clearly. Each scene's line must fit inside its
+# own clip — a longer line gets rushed or cut off mid-word at the scene cut.
+_VO_WORDS_PER_SECOND = {"English": 2.2}
+_VO_WORDS_PER_SECOND_DEFAULT = 1.6  # Indic-language words are longer
+# Leave silence at both ends of each clip so speech never straddles a cut.
+_VO_EDGE_SECONDS = 0.8
+
+
+def _voiceover_word_budget(duration_seconds, language):
+    wps = _VO_WORDS_PER_SECOND.get(language, _VO_WORDS_PER_SECOND_DEFAULT)
+    return max(3, int((duration_seconds - _VO_EDGE_SECONDS) * wps))
+
+
+def build_voiceover_prompt(business, voiceover_text, scenes):
+    """One narration line per scene, matched to that scene's visuals and
+    short enough to be spoken inside that scene's clip."""
+    language = _get(business, "language", "English")
+    scene_lines = "\n".join(
+        f'{i + 1}. {s.get("duration_seconds")}s, max '
+        f'{_voiceover_word_budget(s.get("duration_seconds") or 8, language)} words — '
+        f'{s.get("visual_description") or s.get("purpose") or ""}'
+        for i, s in enumerate(scenes)
+    )
     return f"""
 You are a professional ad script writer for small business marketing videos.
 
-Write a natural voiceover script in {_get(business, "language", "English")} for
-this business using ONLY the advertisement brief from the mobile app:
+Write the voiceover in {language} for this business using ONLY the
+advertisement brief from the mobile app, as exactly {len(scenes)} lines —
+one per scene below, in order.
+
+Scenes (duration, word limit, what is on screen):
+{scene_lines}
+
+Line rules (CRITICAL):
+- Line N is spoken over scene N only, so it must talk about what scene N shows.
+- Stay within each line's word limit — it has to be spoken calmly inside that
+  scene's clip. A line may be empty ("") if the scene works better without words.
+- Each line is a complete phrase or sentence; never continue a sentence into
+  the next line.
+- Only words to be spoken aloud: no labels, speaker names, music or sound
+  cues, stage directions, markdown, or quotes around the text.
+- Return ONLY a JSON array of {len(scenes)} strings, e.g. ["…", "…"].
+
+Use ONLY the advertisement brief from the mobile app:
 
 Business name: {_get(business, "name")}
 Category: {_get(business, "category")}
@@ -782,9 +853,53 @@ Rules:
 
 Voiceover text from the plan (refine, do not invent new facts):
 {voiceover_text}
-
-Return only the final script.
 """
+
+
+_VO_LABEL_RE = re.compile(r"^\s*([^\s:：]{1,30}(?:\s[^\s:：]{1,30}){0,2})\s*[:：]\s*")
+# Labels marking a music/sound cue rather than narration (English + Hindi/Marathi).
+_VO_CUE_LABEL_RE = re.compile(r"music|sound|sfx|ambien|संगीत|ध्वनी|ध्वनि|आवाज", re.IGNORECASE)
+
+
+def _clean_voiceover_line(line):
+    """Strip markdown and leading 'Label:' prefixes that Veo would otherwise
+    read aloud; a line labelled as a music/sound cue is dropped entirely."""
+    text = re.sub(r"[*_`#]+", "", str(line or "")).strip()
+    label = _VO_LABEL_RE.match(text)
+    if label:
+        if _VO_CUE_LABEL_RE.search(label.group(1)):
+            return ""
+        text = text[label.end():]
+    return text.strip().strip('"“”').strip()
+
+
+def parse_voiceover_lines(raw_text, scenes, language):
+    """Per-scene lines from the voiceover JSON; falls back to splitting
+    plain text by sentence if Gemini didn't return a usable array."""
+    n = len(scenes)
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (raw_text or "").strip())
+    try:
+        lines = json.loads(cleaned)
+        if not isinstance(lines, list):
+            raise ValueError("voiceover JSON is not a list")
+    except ValueError:
+        logger.warning("Voiceover was not a JSON array — splitting by sentence")
+        spoken = " ".join(
+            filter(None, (_clean_voiceover_line(row) for row in cleaned.splitlines()))
+        )
+        lines = _split_voiceover_script(spoken, n)
+    lines = [_clean_voiceover_line(line) for line in lines][:n]
+    lines += [""] * (n - len(lines))
+
+    for i, (line, scene) in enumerate(zip(lines, scenes)):
+        budget = _voiceover_word_budget(scene.get("duration_seconds") or 8, language)
+        if len(line.split()) > budget * 1.25:
+            logger.warning(
+                "Voiceover line %d has %d words for a %ss scene (budget %d) — "
+                "it may be rushed: %s",
+                i + 1, len(line.split()), scene.get("duration_seconds"), budget, line,
+            )
+    return lines
 
 
 # =========================================================================
@@ -796,7 +911,8 @@ def build_overlay_text(business):
     return {
         "business_name": _get(business, "name"),
         "offer_text": "",
-        "cta_text": _LANGUAGE_CTA.get(lang, _LANGUAGE_CTA["English"]),
+        "cta_text": _get(business, "cta_text")
+        or _LANGUAGE_CTA.get(lang, _LANGUAGE_CTA["English"]),
         "phone": _get(business, "phone"),
         "website": _get(business, "website"),
         "address": _get(business, "address"),
@@ -806,17 +922,38 @@ def build_overlay_text(business):
 # =========================================================================
 # Execution engine — retry wrapper, Gemini calls, Veo calls
 # =========================================================================
+class _RetryGaveUp(RuntimeError):
+    """Raised once _with_retries stops trying, so an outer _with_retries
+    doesn't multiply the attempts of an inner one."""
+
+
+def _http_status(exc: Exception) -> Optional[int]:
+    code = getattr(exc, "code", None)  # google.genai.errors.APIError
+    return code if isinstance(code, int) else None
+
+
 def _with_retries(fn, what):
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn()
+        except _RetryGaveUp:
+            raise
         except Exception as e:  # noqa: BLE001 - want to retry on anything transient
             last_err = e
+            status = _http_status(e)
+            # 4xx (billing off, bad request, permission denied) won't change on
+            # retry — fail fast. 408 timeouts and 429 quota bursts are transient.
+            if status is not None and 400 <= status < 500 and status not in (408, 429):
+                logger.warning("%s failed with non-retryable HTTP %d: %s", what, status, e)
+                raise _RetryGaveUp(f"{what} failed: {e}") from e
             logger.warning("%s failed (attempt %d/%d): %s", what, attempt, MAX_RETRIES, e)
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-    raise RuntimeError(f"{what} failed after {MAX_RETRIES} attempts") from last_err
+                time.sleep(
+                    QUOTA_RETRY_BACKOFF_SECONDS if status == 429
+                    else RETRY_BACKOFF_SECONDS * attempt
+                )
+    raise _RetryGaveUp(f"{what} failed after {MAX_RETRIES} attempts: {last_err}") from last_err
 
 
 def _image_part(path: str):
@@ -962,8 +1099,15 @@ def _find_font():
     return None
 
 
-def _ffmpeg_escape(text):
-    return (text or "").replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+def _drawtext_source(text, path):
+    """Write caption text to a file for drawtext's textfile= option.
+
+    Inline text= needs filtergraph escaping that breaks on quotes and other
+    punctuation; textfile= with expansion=none takes the text verbatim.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return f"textfile='{path}':expansion=none"
 
 
 def burn_in_overlay(in_path, out_path, overlay, total_seconds):
@@ -987,10 +1131,12 @@ def burn_in_overlay(in_path, out_path, overlay, total_seconds):
         return in_path
 
     filters = []
+    text_dir = os.path.dirname(os.path.abspath(in_path))
     intro_text = " | ".join(t for t in [overlay["business_name"], overlay["cta_text"]] if t)
     if intro_text:
+        source = _drawtext_source(intro_text, os.path.join(text_dir, "overlay_intro.txt"))
         filters.append(
-            f"drawtext=fontfile='{font}':text='{_ffmpeg_escape(intro_text)}':"
+            f"drawtext=fontfile='{font}':{source}:"
             "fontcolor=white:fontsize=42:box=1:boxcolor=black@0.55:boxborderw=14:"
             "x=(w-text_w)/2:y=h-h/6:enable='between(t,0,3)'"
         )
@@ -999,8 +1145,9 @@ def burn_in_overlay(in_path, out_path, overlay, total_seconds):
     outro_text = " | ".join(outro_parts)
     if outro_text:
         start = max(0, total_seconds - 3)
+        source = _drawtext_source(outro_text, os.path.join(text_dir, "overlay_outro.txt"))
         filters.append(
-            f"drawtext=fontfile='{font}':text='{_ffmpeg_escape(outro_text)}':"
+            f"drawtext=fontfile='{font}':{source}:"
             "fontcolor=white:fontsize=36:box=1:boxcolor=black@0.55:boxborderw=14:"
             f"x=(w-text_w)/2:y=h-h/6:enable='between(t,{start},{total_seconds})'"
         )
@@ -1010,20 +1157,18 @@ def burn_in_overlay(in_path, out_path, overlay, total_seconds):
 
     try:
         _run_ffmpeg(
-            ["ffmpeg", "-y", "-i", in_path, "-vf", ",".join(filters),
+            [FFMPEG_BIN, "-y", "-i", in_path, "-vf", ",".join(filters),
              "-c:a", "copy", "-movflags", "+faststart", out_path],
             label="burn-in overlay",
         )
         return out_path
     except RuntimeError as exc:
         # Last-resort: never fail the whole job after Veo clips succeeded.
-        if "drawtext" in str(exc).lower() or "filter not found" in str(exc).lower():
-            logger.warning(
-                "drawtext burn-in failed (%s) — saving plain video without overlay.",
-                exc,
-            )
-            return in_path
-        raise
+        logger.warning(
+            "drawtext burn-in failed (%s) — saving plain video without overlay.",
+            exc,
+        )
+        return in_path
 
 
 # =========================================================================
@@ -1038,6 +1183,7 @@ def _run_video_job(
     camera_motion: str,
     user_id: str,
     starting_image_type: str = "Scene",
+    cta_text: str = "",
 ):
     """
     4-step pipeline driven only by the mobile app API fields:
@@ -1045,7 +1191,7 @@ def _run_video_job(
       starting_image_type, starting_image (optional).
 
       1. Gemini writes a structured JSON ad plan from ad_text.
-      2. A voiceover script is generated & split into one line per scene.
+      2. One voiceover line is written per scene, sized to its duration.
       3. Scenes are generated in parallel (fast) for speed.
       4. Clips are stitched, trimmed, and text overlaid when ffmpeg allows.
     """
@@ -1081,6 +1227,7 @@ def _run_video_job(
             "address": parsed["address"],
             "camera_motion": camera_motion,
             "starting_image_type": starting_image_type,
+            "cta_text": cta_text,
         }
         aspect_ratio = "9:16"
         fast_mode = False
@@ -1113,11 +1260,19 @@ def _run_video_job(
 
             # --- Step 2: voiceover script ---
             update_job(job_id, progress="Step 2/4: Writing voiceover script")
-            voiceover_script = call_gemini_text(
-                gemini_client,
-                build_voiceover_prompt(business, plan.get("voiceover", ""))
+            scenes = plan["scenes"]
+            voiceover_lines = parse_voiceover_lines(
+                call_gemini_text(
+                    gemini_client,
+                    build_voiceover_prompt(business, plan.get("voiceover", ""), scenes),
+                ),
+                scenes,
+                language_name,
             )
-            logger.info("Job %s voiceover: %.300s", job_id, voiceover_script)
+            voiceover_script = "\n".join(
+                f"[{i + 1}] {line}" for i, line in enumerate(voiceover_lines)
+            )
+            logger.info("Job %s voiceover:\n%s", job_id, voiceover_script)
             log_generation_event({
                 "job_id": job_id,
                 "user_id": user_id,
@@ -1128,8 +1283,6 @@ def _run_video_job(
             })
 
             # --- Step 3: scene generation ---
-            scenes = plan["scenes"]
-            voiceover_lines = _split_voiceover_script(voiceover_script, len(scenes))
 
             # Pre-compute static summaries for all scenes (doesn't depend on
             # any scene actually having finished generating yet).
@@ -1209,21 +1362,13 @@ def _run_video_job(
             filename = f"{job_id}.mp4"
             stitched_path = os.path.join(tmp_dir, "stitched_no_overlay.mp4")
 
-            if len(clip_paths) == 1:
-                _run_ffmpeg(
-                    [
-                        "ffmpeg", "-y", "-i", clip_paths[0],
-                        "-t", str(target_seconds), "-c", "copy", stitched_path,
-                    ],
-                    label="single-clip trim",
-                )
-            else:
-                concat_and_trim(
-                    clip_paths,
-                    stitched_path,
-                    target_seconds,
-                    work_dir=tmp_dir,
-                )
+            concat_and_trim(
+                clip_paths,
+                stitched_path,
+                target_seconds,
+                durations=[scene.get("duration_seconds") for scene in scenes],
+                aspect_ratio=aspect_ratio,
+            )
 
             out_path = os.path.join(GENERATED_DIR, filename)
             if burn_in_text:
@@ -1232,19 +1377,19 @@ def _run_video_job(
                 # burn_in_overlay may return in_path if no font/drawtext found
                 if result_path != out_path:
                     _run_ffmpeg(
-                        ["ffmpeg", "-y", "-i", result_path, "-c", "copy",
+                        [FFMPEG_BIN, "-y", "-i", result_path, "-c", "copy",
                          "-movflags", "+faststart", out_path],
                         label="copy to output",
                     )
             else:
                 _run_ffmpeg(
-                    ["ffmpeg", "-y", "-i", stitched_path, "-c", "copy",
+                    [FFMPEG_BIN, "-y", "-i", stitched_path, "-c", "copy",
                      "-movflags", "+faststart", out_path],
                     label="copy to output",
                 )
 
-        # Upload to S3
-        update_job(job_id, progress="Uploading to S3")
+        # Store under the user (S3, or generated/users/... with MEDIA_STORAGE=local)
+        update_job(job_id, progress="Saving video")
         video_url, s3_key = store_generated_media(
             local_path=out_path,
             user_id=user_id,
@@ -1326,6 +1471,7 @@ async def api_generate_video(
     camera_motion: str = Form("Zoom (In)"),
     starting_image_type: str = Form("Scene"),
     starting_image: Optional[UploadFile] = File(None),
+    cta_text: str = Form("", description="Overlay button text; defaults per language, e.g. Call Now"),
 ):
     """
     Starts an async video generation job (same fields the Flutter app sends).
@@ -1338,6 +1484,7 @@ async def api_generate_video(
       - camera_motion: e.g. Zoom (In)
       - starting_image_type: Scene | Logo | Product (default Scene)
       - starting_image: optional first-frame image file
+      - cta_text: optional overlay button text (default per language, e.g. "Call Now")
 
     Returns job_id. Poll GET /api/video/status/{job_id} for video_url.
     """
@@ -1406,6 +1553,7 @@ async def api_generate_video(
         camera_motion,
         uid,
         image_type,
+        cta_text.strip()[:_MAX_BRIEF_FIELD_CHARS],
     )
 
     return VideoGenerateResponse(job_id=job_id, status="queued", user_id=uid)

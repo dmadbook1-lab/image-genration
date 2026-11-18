@@ -62,6 +62,12 @@ def _post_sync(payload: dict[str, Any]) -> None:
             )
         else:
             logger.info("generation log shipped job_id=%s status=%s", payload.get("job_id"), payload.get("status"))
+    except httpx.TransportError as exc:
+        # Admin backend down/unreachable is expected in local dev — one line, no traceback.
+        logger.warning(
+            "generation log not shipped for job_id=%s — %s unreachable: %s",
+            payload.get("job_id"), url, exc,
+        )
     except Exception:
         logger.exception("generation log POST error for job_id=%s", payload.get("job_id"))
 

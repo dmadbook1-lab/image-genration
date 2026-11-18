@@ -49,6 +49,7 @@ htmlcov/
 
 # macOS
 .DS_Store
+._*
 
 # Logs
 *.log
@@ -56,9 +57,11 @@ htmlcov/
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # GCP service account credentials (never commit)
 video-generation-veo-502109-7f1a9e95d0c7.json
+advpost-video-*.json
 *-credentials.json
 *service-account*.json
 

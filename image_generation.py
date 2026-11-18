@@ -253,7 +253,7 @@ def _run_image_job(
             output_path=output_path,
         )
 
-        update_job(job_id, progress="Uploading to S3")
+        update_job(job_id, progress="Saving image")
         public_url, s3_key = store_generated_media(
             local_path=output_path,
             user_id=user_id,
