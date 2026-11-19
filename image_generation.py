@@ -25,6 +25,7 @@ from pydantic import BaseModel, BeforeValidator, WithJsonSchema
 from generation_logger import log_generation_event
 from job_runtime import create_job, get_job, submit_job, update_job
 from s3_storage import normalize_user_id, store_generated_media
+from watermark import apply_watermark
 
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -252,6 +253,10 @@ def _run_image_job(
             quality=quality,
             output_path=output_path,
         )
+
+        # Brand every AI photo with the AdvPost logo before it is saved/uploaded.
+        if apply_watermark(output_path):
+            logger.info("Image job %s: AdvPost watermark applied", job_id)
 
         update_job(job_id, progress="Saving image")
         public_url, s3_key = store_generated_media(
